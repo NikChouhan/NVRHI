@@ -1,3 +1,5 @@
 build*/
 .vscode/
 nvapi/
+compile_commands.json
+*.bat
