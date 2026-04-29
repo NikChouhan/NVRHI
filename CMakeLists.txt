@@ -42,9 +42,14 @@ option(NVRHI_WITH_AFTERMATH "Include Aftermath support (requires NSight Aftermat
 cmake_dependent_option(NVRHI_WITH_NVAPI "Include NVAPI support (requires NVAPI SDK)" OFF "WIN32" OFF)
 cmake_dependent_option(NVRHI_WITH_DX11 "Build the NVRHI D3D11 backend" ON "WIN32" OFF)
 cmake_dependent_option(NVRHI_WITH_DX12 "Build the NVRHI D3D12 backend" ON "WIN32" OFF)
+cmake_dependent_option(NVRHI_WITH_METAL3 "Build the NVRHI Metal 3 backend" ON "APPLE" OFF)
 
 if(NVRHI_WITH_DX12)
     option(NVRHI_D3D12_WITH_DXR12_OPACITY_MICROMAP "Use D3D12 native Opacity Micromaps from DXR 1.2" OFF)
+endif()
+
+if(NVRHI_WITH_METAL3)
+    enable_language(OBJCXX)
 endif()
 
 if (NVRHI_BUILD_SHARED)
@@ -189,6 +194,25 @@ set(src_vk
     src/vulkan/vulkan-texture.cpp
     src/vulkan/vulkan-upload.cpp
     src/vulkan/vulkan-backend.h)
+
+set(include_metal3
+    include/nvrhi/metal3.h)
+set(src_metal3_impl
+    src/metal3/metal3-buffer.cpp
+    src/metal3/metal3-commandlist.cpp
+    src/metal3/metal3-compute.cpp
+    src/metal3/metal3-constants.cpp
+    src/metal3/metal3-device.cpp
+    src/metal3/metal3-graphics.cpp
+    src/metal3/metal3-queries.cpp
+    src/metal3/metal3-raytracing.cpp
+    src/metal3/metal3-resource-bindings.cpp
+    src/metal3/metal3-shader.cpp
+    src/metal3/metal3-state-tracking.cpp
+    src/metal3/metal3-texture.cpp)
+set(src_metal3
+    src/metal3/metal3-backend.h
+    ${src_metal3_impl})
 
 # NVRHI interface and common implementation functions
 
@@ -338,6 +362,37 @@ if (NVRHI_WITH_VULKAN)
     target_compile_definitions(${nvrhi_vulkan_target} PRIVATE NVRHI_WITH_AFTERMATH=$<BOOL:${NVRHI_WITH_AFTERMATH}>)
 endif()
 
+if (NVRHI_WITH_METAL3)
+    if (NVRHI_BUILD_SHARED)
+        set(nvrhi_metal3_target nvrhi)
+
+        target_sources(${nvrhi_metal3_target} PRIVATE
+            ${include_metal3}
+            ${src_metal3})
+    else()
+        set(nvrhi_metal3_target nvrhi_metal3)
+
+        add_library(${nvrhi_metal3_target} STATIC
+            ${include_metal3}
+            ${src_metal3})
+
+        set_target_properties(${nvrhi_metal3_target} PROPERTIES FOLDER "NVRHI")
+        target_include_directories(${nvrhi_metal3_target} PRIVATE include)
+    endif()
+
+    find_library(NVRHI_METAL_FRAMEWORK Metal REQUIRED)
+    find_library(NVRHI_FOUNDATION_FRAMEWORK Foundation REQUIRED)
+    find_library(NVRHI_QUARTZCORE_FRAMEWORK QuartzCore REQUIRED)
+
+    set_source_files_properties(${src_metal3_impl} PROPERTIES LANGUAGE OBJCXX)
+    target_compile_features(${nvrhi_metal3_target} PRIVATE cxx_std_17)
+    target_link_libraries(${nvrhi_metal3_target}
+        PUBLIC
+            ${NVRHI_METAL_FRAMEWORK}
+            ${NVRHI_FOUNDATION_FRAMEWORK}
+            ${NVRHI_QUARTZCORE_FRAMEWORK})
+endif()
+
 
 if (NVRHI_INSTALL)
     install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/nvrhi
@@ -360,6 +415,10 @@ if (NVRHI_INSTALL)
 
         if (NVRHI_WITH_VULKAN)
             install(TARGETS ${nvrhi_vulkan_target} DESTINATION "lib" EXPORT "nvrhiTargets")
+        endif()
+
+        if (NVRHI_WITH_METAL3)
+            install(TARGETS ${nvrhi_metal3_target} DESTINATION "lib" EXPORT "nvrhiTargets")
         endif()
     endif()
 
@@ -390,3 +449,16 @@ if (NVRHI_INSTALL)
             DESTINATION "${nvrhi_CONFIG_PATH}")
     endif()
 endif()
+
+# ---------------------------------------------------------------------------
+# Triangle test
+# soon will create multiple tests prolly but its a good start
+# ---------------------------------------------------------------------------
+add_executable(triangle main.cpp)
+set_source_files_properties(main.cpp PROPERTIES LANGUAGE OBJCXX)
+
+target_compile_options(triangle PRIVATE "$<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>")
+target_link_libraries(triangle PRIVATE
+    nvrhi
+    nvrhi_metal3
+    "-framework Cocoa")
