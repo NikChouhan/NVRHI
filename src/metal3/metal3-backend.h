@@ -79,6 +79,18 @@ namespace nvrhi::metal3
         Object getNativeView(ObjectType objectType, Format format = Format::UNKNOWN, TextureSubresourceSet subresources = AllSubresources, TextureDimension dimension = TextureDimension::Unknown, bool isReadOnlyDSV = false) override;
     };
 
+    class Buffer : public RefCounter<IBuffer>
+    {
+    public:
+        BufferDesc desc;
+        id<MTLBuffer> buffer = nil;
+        bool ownsBuffer = true;
+
+        const BufferDesc& getDesc() const override { return desc; }
+        GpuVirtualAddress getGpuVirtualAddress() const override { return buffer ? buffer.gpuAddress : 0; }
+        Object getNativeObject(ObjectType objectType) override;
+    };
+
     // metal3 device
     /* 
      * device functions declarations of virtual nvrhi functions declared in nvrhi.h
@@ -155,6 +167,7 @@ namespace nvrhi::metal3
 
         MeshletPipelineHandle createMeshletPipeline(const MeshletPipelineDesc& desc, IFramebuffer* fb) override;
 
+        // Unsupported: RT backend is WIP
         rt::PipelineHandle createRayTracingPipeline(const rt::PipelineDesc& desc) override;
 
         BindingLayoutHandle createBindingLayout(const BindingLayoutDesc& desc) override;
