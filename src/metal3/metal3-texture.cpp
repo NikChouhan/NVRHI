@@ -37,6 +37,12 @@ namespace nvrhi::metal3
             return nullptr;
         }
 
+        if (d.isTiled || d.isVirtual)
+        {
+            m_Context.error("[nvrhi] Metal3 tiled/virtual textures are not implemented.");
+            return nullptr;
+        }
+
         MTLTextureDescriptor* td = [[MTLTextureDescriptor alloc] init];
         td.textureType = convertTextureDimension(d.dimension, d.sampleCount);
         td.pixelFormat = pixelFormat;

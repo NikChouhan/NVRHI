@@ -81,6 +81,14 @@ namespace nvrhi::metal3
         Object getNativeView(ObjectType objectType, Format format = Format::UNKNOWN, TextureSubresourceSet subresources = AllSubresources, TextureDimension dimension = TextureDimension::Unknown, bool isReadOnlyDSV = false) override;
     };
 
+    //TODO: stub
+    class StagingTexture : public RefCounter<IStagingTexture>
+    {
+    public:
+        TextureDesc desc;
+        const TextureDesc& getDesc() const override { return desc; }
+    };
+
     class Buffer : public RefCounter<IBuffer>
     {
     public:
@@ -114,6 +122,8 @@ namespace nvrhi::metal3
         HeapHandle createHeap(const HeapDesc& d) override;
 
         TextureHandle createTexture(const TextureDesc& d) override;
+
+        // Metal3: useful for texture allocated inside heaps, for manual/placed allocation; we create committed textures directly currently
         MemoryRequirements getTextureMemoryRequirements(ITexture* texture) override;
         // Metal 3: nothing like binding a texture memory in metal, does nothing, a stub
         bool bindTextureMemory(ITexture* texture, IHeap* heap, uint64_t offset) override;
@@ -133,6 +143,8 @@ namespace nvrhi::metal3
         BufferHandle createBuffer(const BufferDesc& d) override;
         void *mapBuffer(IBuffer* b, CpuAccessMode mapFlags) override;
         void unmapBuffer(IBuffer* b) override;
+
+        // Metal3: useful for buffers allocated inside heaps, for manual/placed allocation; we create committed buffers directly currently
         MemoryRequirements getBufferMemoryRequirements(IBuffer* buffer) override;
         bool bindBufferMemory(IBuffer* buffer, IHeap* heap, uint64_t offset) override;
 
