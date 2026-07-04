@@ -34,6 +34,19 @@ namespace nvrhi::metal3
     // TODO: for future when RT backend will be added
     class DummyAccelStruct;
 
+    // implementation in metal3-constants.cpp
+    MTLTextureType convertTextureDimension(TextureDimension dimension, uint32_t sampleCount);
+    MTLResourceOptions convertCpuAccess(CpuAccessMode cpuAccess);
+    MTLVertexFormat convertVertexFormat(Format format);
+    MTLIndexType convertIndexFormat(Format format);
+    MTLPrimitiveType convertPrimitiveType(PrimitiveType primitiveType);
+    MTLCullMode convertCullMode(RasterCullMode cullMode);
+    MTLWinding convertWinding(bool frontCounterClockwise);
+    MTLCompareFunction convertCompareFunction(ComparisonFunc func);
+    MTLSamplerAddressMode convertSamplerAddressMode(SamplerAddressMode mode);
+    MTLBlendFactor convertBlendFactor(BlendFactor factor);
+    MTLBlendOperation convertBlendOp(BlendOp op);
+
     // metal 3 context
     struct MTL3Context
     {
