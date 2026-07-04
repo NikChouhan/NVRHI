@@ -51,6 +51,13 @@ namespace nvrhi::metal3
         // always create private textures, fill them using command lists if CPU data needs be written
         td.storageMode = MTLStorageModePrivate;
 
+        MTLSizeAndAlign sizeAndAlign = [m_Context.device heapTextureSizeAndAlignWithDescriptor:td];
+
+        Texture* texture = new Texture();
+        // cache tex descriptor size and alignment for use for device.getTextureMemoryRequirements(...)
+        texture->memSize = sizeAndAlign.size;
+        texture->memAlign = sizeAndAlign.align;
+
         id<MTLTexture> nativeTexture = [m_Context.device newTextureWithDescriptor:td];
         if (!nativeTexture)
         {
@@ -61,7 +68,6 @@ namespace nvrhi::metal3
         if (!d.debugName.empty())
             nativeTexture.label = [NSString stringWithUTF8String:d.debugName.c_str()];
 
-        Texture* texture = new Texture();
         texture->desc = d;
         texture->texture = nativeTexture;
         return TextureHandle::Create(texture);

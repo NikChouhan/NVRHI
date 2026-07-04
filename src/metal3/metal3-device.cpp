@@ -1,5 +1,6 @@
 #include "metal3-backend.h"
 #include "nvrhi/common/misc.h"
+#include "nvrhi/common/resource.h"
 #include <Metal/Metal.h>
 #include <cstdio>
 
@@ -71,5 +72,42 @@ namespace nvrhi::metal3
         if (objectType == ObjectTypes::MTL3_CommandQueue)
             return Object((__bridge void*)m_Context.commonQueue);
         return nullptr;
+    }
+
+    bool Device::waitForIdle()
+    {
+        id<MTLCommandBuffer> commandBuffer = [m_Context.commonQueue commandBuffer];
+        [commandBuffer commit];
+        [commandBuffer waitUntilCompleted];
+        return true;
+    }
+
+    void Device::runGarbageCollection()
+    {
+    }
+
+    HeapHandle Device::createHeap(const HeapDesc& d)
+    {
+        (void)d;
+        m_Context.warning("[nvrhi] Metal3 heaps are not implemented; using placed resources is unsupported.");
+        return nullptr;
+    }
+
+    MemoryRequirements Device::getTextureMemoryRequirements(ITexture* texture)
+    {
+        MemoryRequirements result{};
+        if (texture)
+        {
+            Texture* t = checked_cast<Texture*>(texture);
+            result.size = t->memSize;
+            result.alignment = t->memAlign;
+        }
+        return result;
+    }
+
+    bool Device::bindTextureMemory(ITexture* texture, IHeap* heap, uint64_t offset)
+    {
+        (void)texture; (void)heap; (void)offset;
+        return false;
     }
 }

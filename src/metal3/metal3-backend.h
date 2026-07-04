@@ -72,6 +72,8 @@ namespace nvrhi::metal3
     public:
         TextureDesc desc;
         id<MTLTexture> texture = nil;
+        NSUInteger memSize;
+        NSUInteger memAlign;
         bool ownsTexture = true;
 
         const TextureDesc& getDesc() const override { return desc; }
@@ -108,10 +110,12 @@ namespace nvrhi::metal3
 
         // IDevice impl
 
+        // Metal3: MTLHeap or resource heaps (closest to dx12/vulkan type descriptor heaps) not implemented yet, does nothing
         HeapHandle createHeap(const HeapDesc& d) override;
 
         TextureHandle createTexture(const TextureDesc& d) override;
         MemoryRequirements getTextureMemoryRequirements(ITexture* texture) override;
+        // Metal 3: nothing like binding a texture memory in metal, does nothing, a stub
         bool bindTextureMemory(ITexture* texture, IHeap* heap, uint64_t offset) override;
 
         TextureHandle createHandleForNativeTexture(ObjectType objectType, Object texture, const TextureDesc& desc) override;
@@ -193,6 +197,7 @@ namespace nvrhi::metal3
 
         CommandListLifetimeTrackerHandle createCommandListLifetimeTracker(CommandQueue executionQueue) override;
 
+        // Metal3: does nothing
         void runGarbageCollection() override;
         bool queryFeatureSupport(Feature feature, void* pInfo = nullptr, size_t infoSize = 0) override;
         FormatSupport queryFormatSupport(Format format) override;
