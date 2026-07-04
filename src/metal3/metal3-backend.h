@@ -60,6 +60,25 @@ namespace nvrhi::metal3
         void info(const std::string& message) const;
     };
 
+    // TODO: stub for now
+    class UploadManager
+    {
+    public:
+        UploadManager(const MTL3Context& context, size_t uploadChunkSize, size_t scratchMaxMem, bool isScratchBuffer);
+    };
+
+    class Texture : public RefCounter<ITexture>
+    {
+    public:
+        TextureDesc desc;
+        id<MTLTexture> texture = nil;
+        bool ownsTexture = true;
+
+        const TextureDesc& getDesc() const override { return desc; }
+        Object getNativeObject(ObjectType objectType) override;
+        Object getNativeView(ObjectType objectType, Format format = Format::UNKNOWN, TextureSubresourceSet subresources = AllSubresources, TextureDimension dimension = TextureDimension::Unknown, bool isReadOnlyDSV = false) override;
+    };
+
     // metal3 device
     /* 
      * device functions declarations of virtual nvrhi functions declared in nvrhi.h
