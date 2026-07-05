@@ -34,6 +34,30 @@ namespace nvrhi::metal3
     // TODO: for future when RT backend will be added
     class DummyAccelStruct;
 
+    // useful for shader reflection
+    enum class MscArgumentType : uint8_t
+    {
+        SRV,
+        UAV,
+        CBV,
+        Sampler
+    };
+
+    struct MscArgumentBinding
+    {
+        uint32_t index = 0;
+        uint32_t slot = 0;
+        uint32_t space = 0;
+        MscArgumentType type = MscArgumentType::SRV;
+    };
+
+    struct MscShaderReflection
+    {
+        bool valid = false;
+        uint32_t resourceCount = 0;
+        std::vector<MscArgumentBinding> topLevelArgumentBuffer;
+    };
+
     // implementation in metal3-constants.cpp
     MTLTextureType convertTextureDimension(TextureDimension dimension, uint32_t sampleCount);
     MTLResourceOptions convertCpuAccess(CpuAccessMode cpuAccess);
@@ -101,6 +125,31 @@ namespace nvrhi::metal3
         Object getNativeObject(ObjectType objectType) override;
     };
 
+    class Shader : public RefCounter<IShader>
+    {
+    public:
+        ShaderDesc desc;
+        id<MTLLibrary> library = nil;
+        id<MTLFunction> function = nil;
+        std::vector<uint8_t> bytecode;
+        MscShaderReflection mscReflection;
+        MTLSize computeThreadsPerGroup = MTLSizeMake(1, 1, 1);
+        bool computeThreadsPerGroupValid = false;
+
+        const ShaderDesc& getDesc() const override { return desc; }
+        void getBytecode(const void** ppBytecode, size_t* pSize) const override;
+    };
+
+    class ShaderLibrary : public RefCounter<IShaderLibrary>
+    {
+    public:
+        id<MTLLibrary> library = nil;
+        std::vector<uint8_t> bytecode;
+
+        void getBytecode(const void** ppBytecode, size_t* pSize) const override;
+        ShaderHandle getShader(const char* entryName, ShaderType shaderType) override;
+    };
+
     class EventQuery : public RefCounter<IEventQuery>
     {
     public:
@@ -158,6 +207,14 @@ namespace nvrhi::metal3
         bool bindBufferMemory(IBuffer* buffer, IHeap* heap, uint64_t offset) override;
 
         BufferHandle createHandleForNativeBuffer(ObjectType objectType, Object buffer, const BufferDesc& desc) override;
+
+        // Metal3: -> the way the current pipeline will handle shaders is by processing *.metallib files by shader reflection and 
+        // storing arguments (index, slots, types, etc) for use later at resource binding/pipeline creation, execution stage. 
+        // -> it also expects a reflection .json file for every shader. 
+        // The path supported is using *metalshader-converter* for generating shader reflection data. The pipeline is as follows:
+        // - *.hlsl -> *.dxil  (with dxc)
+        // - *.dxil -> *.metallib (metalshader-converter)
+        // - *.metallib -> *.reflection.json (with msc's reflection aergument)
 
         ShaderHandle createShader(const ShaderDesc& d, const void* binary, size_t binarySize) override;
         ShaderHandle createShaderSpecialization(IShader* baseShader, const ShaderSpecialization* constants, uint32_t numConstants) override;
