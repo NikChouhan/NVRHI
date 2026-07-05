@@ -101,6 +101,15 @@ namespace nvrhi::metal3
         Object getNativeObject(ObjectType objectType) override;
     };
 
+    class EventQuery : public RefCounter<IEventQuery>
+    {
+    public:
+        dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+        std::atomic<bool> signaled{ true };
+    };
+    // TODO: stub
+    class TimerQuery : public RefCounter<ITimerQuery> { public: bool resolved = true; float time = 0.f; };
+
     // metal3 device
     /* 
      * device functions declarations of virtual nvrhi functions declared in nvrhi.h

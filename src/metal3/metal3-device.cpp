@@ -273,5 +273,136 @@ namespace nvrhi::metal3
         utils::NotSupported();
         return baseShader;
     }
-    
+    EventQueryHandle Device::createEventQuery()
+    {
+        return EventQueryHandle::Create(new EventQuery());
+    }
+
+    void Device::setEventQuery(IEventQuery* query, CommandQueue queue)
+    {
+        (void)queue;
+
+        EventQuery* event = static_cast<EventQuery*>(query);
+        if (!event || !event->semaphore || !m_Context.commonQueue)
+            return;
+
+        event->signaled.store(false, std::memory_order_release);
+
+        event->AddRef();
+
+        // The renderer uses event queries as per-frame fences. Put a marker
+        // command buffer after the already-submitted frame work on the same
+        // Metal queue; when this marker completes, all earlier frame commands
+        // are complete too and the frame slot can be reused.
+
+        id<MTLCommandBuffer> commandBuffer = [m_Context.commonQueue commandBuffer];
+        [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer>) {
+            event->signaled.store(true, std::memory_order_release);
+            dispatch_semaphore_signal(event->semaphore);
+            event->Release();
+        }];
+        [commandBuffer commit];
+    }
+
+    bool Device::pollEventQuery(IEventQuery* query)
+    {
+        EventQuery* event = static_cast<EventQuery*>(query);
+        return event && event->signaled.load(std::memory_order_acquire);
+    }
+
+    void Device::waitEventQuery(IEventQuery* query)
+    {
+        EventQuery* event = static_cast<EventQuery*>(query);
+        if (!event || !event->semaphore)
+            return;
+
+        if (!event->signaled.load(std::memory_order_acquire))
+            dispatch_semaphore_wait(event->semaphore, DISPATCH_TIME_FOREVER);
+
+        event->signaled.store(true, std::memory_order_release);
+    }
+
+    void Device::resetEventQuery(IEventQuery* query)
+    {
+        EventQuery* event = static_cast<EventQuery*>(query);
+        if (!event || !event->semaphore)
+            return;
+
+        while (dispatch_semaphore_wait(event->semaphore, DISPATCH_TIME_NOW) == 0) {}
+        event->signaled.store(false, std::memory_order_release);
+    }
+
+    bool Device::queryFeatureSupport(Feature feature, void* pInfo, size_t infoSize)
+    {
+        (void)pInfo; (void)infoSize;
+        switch (feature)
+        {
+        case Feature::ComputeQueue:
+        case Feature::CopyQueue:
+        case Feature::ConstantBufferRanges:
+            return true;
+        default:
+            return false;
+        }
+    }
+    MTLPixelFormat convertFormat(nvrhi::Format format)
+    {
+        switch (format)
+        {
+        case Format::RGBA8_UNORM:
+            return MTLPixelFormatRGBA8Unorm;
+        case Format::BGRA8_UNORM:
+            return MTLPixelFormatBGRA8Unorm;
+        case Format::SRGBA8_UNORM:
+            return MTLPixelFormatRGBA8Unorm_sRGB;
+        case Format::SBGRA8_UNORM:
+            return MTLPixelFormatBGRA8Unorm_sRGB;
+        case Format::R8_UNORM:
+            return MTLPixelFormatR8Unorm;
+        case Format::RG8_UNORM:
+            return MTLPixelFormatRG8Unorm;
+        case Format::R32_UINT:
+            return MTLPixelFormatR32Uint;
+        case Format::R16_FLOAT:
+            return MTLPixelFormatR16Float;
+        case Format::RG16_FLOAT:
+            return MTLPixelFormatRG16Float;
+        case Format::RGBA16_FLOAT:
+            return MTLPixelFormatRGBA16Float;
+        case Format::R32_FLOAT:
+            return MTLPixelFormatR32Float;
+        case Format::RG32_FLOAT:
+            return MTLPixelFormatRG32Float;
+        case Format::RGBA32_FLOAT:
+            return MTLPixelFormatRGBA32Float;
+        case Format::BC1_UNORM:
+            return MTLPixelFormatBC1_RGBA;
+        case Format::BC1_UNORM_SRGB:
+            return MTLPixelFormatBC1_RGBA_sRGB;
+        case Format::BC2_UNORM:
+            return MTLPixelFormatBC2_RGBA;
+        case Format::BC2_UNORM_SRGB:
+            return MTLPixelFormatBC2_RGBA_sRGB;
+        case Format::BC3_UNORM:
+            return MTLPixelFormatBC3_RGBA;
+        case Format::BC3_UNORM_SRGB:
+            return MTLPixelFormatBC3_RGBA_sRGB;
+        case Format::BC4_UNORM:
+            return MTLPixelFormatBC4_RUnorm;
+        case Format::BC4_SNORM:
+            return MTLPixelFormatBC4_RSnorm;
+        case Format::BC5_UNORM:
+            return MTLPixelFormatBC5_RGUnorm;
+        case Format::BC5_SNORM:
+            return MTLPixelFormatBC5_RGSnorm;
+        case Format::D32:
+            return MTLPixelFormatDepth32Float;
+        case Format::D24S8:
+            return MTLPixelFormatDepth24Unorm_Stencil8;
+        case Format::D32S8:
+            return MTLPixelFormatDepth32Float_Stencil8;
+        default:
+            return MTLPixelFormatInvalid;
+        }
+    }
 }
