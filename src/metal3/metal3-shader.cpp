@@ -57,6 +57,22 @@ namespace nvrhi::metal3
         return false;
     }
 
+    static std::string normalizeMscVertexInputName(const std::string& value)
+    {
+        std::string result;
+        result.reserve(value.size());
+        for (unsigned char ch : value)
+        {
+            if (std::isalnum(ch))
+                result.push_back(static_cast<char>(std::tolower(ch)));
+        }
+
+        while (!result.empty() && std::isdigit(static_cast<unsigned char>(result.back())))
+            result.pop_back();
+
+        return result;
+    }
+
     static bool parseMscReflectionJson(const std::string& json, MscShaderReflection& reflection, MTLSize* computeThreads)
     {
         std::smatch match;
@@ -100,6 +116,30 @@ namespace nvrhi::metal3
             binding.type = type;
             reflection.topLevelArgumentBuffer.push_back(binding);
         }
+
+        std::regex vertexInputsRegex(R"("vertex_inputs"\s*:\s*\[([^\]]*)\])");
+        if (std::regex_search(json, match, vertexInputsRegex))
+        {
+            const std::string vertexInputs = match[1].str();
+            std::regex objectRegex(R"(\{[^\}]*\})");
+            std::regex indexRegex(R"("index"\s*:\s*([0-9]+))");
+            std::regex nameRegex(R"name("name"\s*:\s*"([^"]+)")name");
+            for (std::sregex_iterator it(vertexInputs.begin(), vertexInputs.end(), objectRegex), end; it != end; ++it)
+            {
+                const std::string object = it->str();
+                std::smatch indexMatch;
+                std::smatch nameMatch;
+                if (!std::regex_search(object, indexMatch, indexRegex) ||
+                    !std::regex_search(object, nameMatch, nameRegex))
+                    continue;
+
+                const std::string name = normalizeMscVertexInputName(nameMatch[1].str());
+                if (!name.empty())
+                    reflection.vertexInputAttributes[name] =
+                        static_cast<uint32_t>(std::stoul(indexMatch[1].str()));
+            }
+        }
+        
         // parse compute threads from reflection data, *tg_size*
         if (computeThreads)
         {
@@ -122,7 +162,7 @@ namespace nvrhi::metal3
             (hasResourceCount && reflection.resourceCount == 0);
         return reflection.valid;
     }
-    
+
     static std::vector<std::filesystem::path> makeMscReflectionCandidates(const std::string& debugName)
     {
         std::vector<std::filesystem::path> candidates;

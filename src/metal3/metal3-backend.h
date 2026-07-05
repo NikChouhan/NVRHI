@@ -56,6 +56,7 @@ namespace nvrhi::metal3
         bool valid = false;
         uint32_t resourceCount = 0;
         std::vector<MscArgumentBinding> topLevelArgumentBuffer;
+        std::unordered_map<std::string, uint32_t> vertexInputAttributes;
     };
 
     // implementation in metal3-constants.cpp
@@ -148,6 +149,47 @@ namespace nvrhi::metal3
 
         void getBytecode(const void** ppBytecode, size_t* pSize) const override;
         ShaderHandle getShader(const char* entryName, ShaderType shaderType) override;
+    };
+
+    class Sampler : public RefCounter<ISampler>
+    {
+    public:
+        SamplerDesc desc;
+        id<MTLSamplerState> sampler = nil;
+        const SamplerDesc& getDesc() const override { return desc; }
+    };
+
+    class InputLayout : public RefCounter<IInputLayout>
+    {
+    public:
+        std::vector<VertexAttributeDesc> attributes;
+        MTLVertexDescriptor* vertexDescriptor = nil;
+        uint32_t getNumAttributes() const override { return uint32_t(attributes.size()); }
+        const VertexAttributeDesc* getAttributeDesc(uint32_t index) const override;
+    };
+
+    class Framebuffer : public RefCounter<IFramebuffer>
+    {
+    public:
+        FramebufferDesc desc;
+        FramebufferInfoEx framebufferInfo;
+        const FramebufferDesc& getDesc() const override { return desc; }
+        const FramebufferInfoEx& getFramebufferInfo() const override { return framebufferInfo; }
+    };
+
+    class GraphicsPipeline : public RefCounter<IGraphicsPipeline>
+    {
+    public:
+        GraphicsPipelineDesc desc;
+        FramebufferInfo framebufferInfo;
+        id<MTLRenderPipelineState> pipeline = nil;
+        id<MTLDepthStencilState> depthStencilState = nil;
+        MTLPrimitiveType primitiveType = MTLPrimitiveTypeTriangle;
+        MTLCullMode cullMode = MTLCullModeNone;
+        MTLWinding frontWinding = MTLWindingClockwise;
+        const GraphicsPipelineDesc& getDesc() const override { return desc; }
+        const FramebufferInfo& getFramebufferInfo() const override { return framebufferInfo; }
+        Object getNativeObject(ObjectType objectType) override;
     };
 
     class ComputePipeline : public RefCounter<IComputePipeline>
