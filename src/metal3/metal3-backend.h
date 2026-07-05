@@ -202,6 +202,25 @@ namespace nvrhi::metal3
         Object getNativeObject(ObjectType objectType) override;
     };
 
+    class BindingLayout : public RefCounter<IBindingLayout>
+    {
+    public:
+        BindingLayoutDesc desc;
+        BindlessLayoutDesc bindlessDesc;
+        bool isBindless = false;
+        const BindingLayoutDesc* getDesc() const override { return isBindless ? nullptr : &desc; }
+        const BindlessLayoutDesc* getBindlessDesc() const override { return isBindless ? &bindlessDesc : nullptr; }
+    };
+
+    class BindingSet : public RefCounter<IBindingSet>
+    {
+    public:
+        BindingSetDesc desc;
+        BindingLayoutHandle layout;
+        const BindingSetDesc* getDesc() const override { return &desc; }
+        IBindingLayout* getLayout() const override { return layout; }
+    };
+
     class EventQuery : public RefCounter<IEventQuery>
     {
     public:
