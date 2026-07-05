@@ -150,6 +150,16 @@ namespace nvrhi::metal3
         ShaderHandle getShader(const char* entryName, ShaderType shaderType) override;
     };
 
+    class ComputePipeline : public RefCounter<IComputePipeline>
+    {
+    public:
+        ComputePipelineDesc desc;
+        id<MTLComputePipelineState> pipeline = nil;
+        MTLSize threadsPerGroup = MTLSizeMake(1, 1, 1);
+        const ComputePipelineDesc& getDesc() const override { return desc; }
+        Object getNativeObject(ObjectType objectType) override;
+    };
+
     class EventQuery : public RefCounter<IEventQuery>
     {
     public:
