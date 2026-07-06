@@ -230,6 +230,143 @@ namespace nvrhi::metal3
     // TODO: stub
     class TimerQuery : public RefCounter<ITimerQuery> { public: bool resolved = true; float time = 0.f; };
 
+    // commandList impl
+    class CommandList final : public RefCounter<nvrhi::metal3::ICommandList>
+    {
+    public:
+
+        // TODO: Internal interface functions (metal 3 specific)
+        CommandList(class Device* device, const MTL3Context& context, const CommandListParameters& params);
+        ~CommandList() override;
+
+        // IResource implementation
+        Object getNativeObject(ObjectType objectType) override;
+
+        // ICommandList implementation
+        void open() override;
+        void close() override;
+        void clearState() override;
+        
+        void clearTextureFloat(ITexture* t, TextureSubresourceSet subresources, const Color& clearColor) override;
+        void clearDepthStencilTexture(ITexture* t, TextureSubresourceSet subresources, bool clearDepth, float depth, bool clearStencil, uint8_t stencil) override;
+        void clearTextureUInt(ITexture* t, TextureSubresourceSet subresources, uint32_t clearColor) override;
+        void clearSamplerFeedbackTexture(ISamplerFeedbackTexture* texture) override;
+        void decodeSamplerFeedbackTexture(IBuffer* buffer, ISamplerFeedbackTexture* texture, Format format) override;
+        void setSamplerFeedbackTextureState(ISamplerFeedbackTexture* texture, ResourceStates stateBits) override;
+
+        void copyTexture(ITexture* dest, const TextureSlice& destSlice, ITexture* src, const TextureSlice& srcSlice) override;
+        void copyTexture(IStagingTexture* dest, const TextureSlice& destSlice, ITexture* src, const TextureSlice& srcSlice) override;
+        void copyTexture(ITexture* dest, const TextureSlice& destSlice, IStagingTexture* src, const TextureSlice& srcSlice) override;
+        void writeTexture(ITexture* dest, uint32_t arraySlice, uint32_t mipLevel, const void* data, size_t rowPitch, size_t depthPitch) override;
+        void resolveTexture(ITexture* dest, const TextureSubresourceSet& dstSubresources, ITexture* src, const TextureSubresourceSet& srcSubresources) override;
+
+        void writeBuffer(IBuffer* b, const void* data, size_t dataSize, uint64_t destOffsetBytes = 0) override;
+        void clearBufferUInt(IBuffer* b, uint32_t clearValue) override;
+        void copyBuffer(IBuffer* dest, uint64_t destOffsetBytes, IBuffer* src, uint64_t srcOffsetBytes, uint64_t dataSizeBytes) override;
+
+        void setPushConstants(const void* data, size_t byteSize) override;
+
+        void setGraphicsState(const GraphicsState& state) override;
+        void draw(const DrawArguments& args) override;
+        void drawIndexed(const DrawArguments& args) override;
+        void drawIndirect(uint32_t offsetBytes, uint32_t drawCount) override;
+        void drawIndexedIndirect(uint32_t offsetBytes, uint32_t drawCount) override;
+        void drawIndexedIndirectCount(uint32_t paramOffsetBytes, uint32_t countOffsetBytes, uint32_t maxDrawCount) override;
+
+        void setComputeState(const ComputeState& state) override;
+        void dispatch(uint32_t groupsX, uint32_t groupsY = 1, uint32_t groupsZ = 1) override;
+        void dispatchIndirect(uint32_t offsetBytes) override;
+
+        void setMeshletState(const MeshletState& state) override;
+        void dispatchMesh(uint32_t groupsX, uint32_t groupsY = 1, uint32_t groupsZ = 1) override;
+
+        void setRayTracingState(const rt::State& state) override;
+        void dispatchRays(const rt::DispatchRaysArguments& args) override;
+
+        void buildOpacityMicromap(rt::IOpacityMicromap* omm, const rt::OpacityMicromapDesc& desc) override;
+        void buildBottomLevelAccelStruct(rt::IAccelStruct* as, const rt::GeometryDesc* pGeometries, size_t numGeometries, rt::AccelStructBuildFlags buildFlags) override;
+        void compactBottomLevelAccelStructs() override;
+        void buildTopLevelAccelStruct(rt::IAccelStruct* as, const rt::InstanceDesc* pInstances, size_t numInstances, rt::AccelStructBuildFlags buildFlags) override;
+        void buildTopLevelAccelStructFromBuffer(rt::IAccelStruct* as, nvrhi::IBuffer* instanceBuffer, uint64_t instanceBufferOffset, size_t numInstances,
+            rt::AccelStructBuildFlags buildFlags = rt::AccelStructBuildFlags::None) override;
+        void executeMultiIndirectClusterOperation(const rt::cluster::OperationDesc& desc) override;
+
+        void convertCoopVecMatrices(coopvec::ConvertMatrixLayoutDesc const* convertDescs, size_t numDescs) override;
+
+        void beginTimerQuery(ITimerQuery* query) override;
+        void endTimerQuery(ITimerQuery* query) override;
+
+        void beginMarker(const char *name) override;
+        void endMarker() override;
+
+        void setEnableAutomaticBarriers(bool enable) override;
+        void setResourceStatesForBindingSet(IBindingSet* bindingSet) override;
+
+        void setEnableUavBarriersForTexture(ITexture* texture, bool enableBarriers) override;
+        void setEnableUavBarriersForBuffer(IBuffer* buffer, bool enableBarriers) override;
+
+        void beginTrackingTextureState(ITexture* texture, TextureSubresourceSet subresources, ResourceStates stateBits) override;
+        void beginTrackingBufferState(IBuffer* buffer, ResourceStates stateBits) override;
+
+        void setTextureState(ITexture* texture, TextureSubresourceSet subresources, ResourceStates stateBits) override;
+        void setBufferState(IBuffer* buffer, ResourceStates stateBits) override;
+        void setAccelStructState(rt::IAccelStruct* as, ResourceStates stateBits) override;
+        
+        void setPermanentTextureState(ITexture* texture, ResourceStates stateBits) override;
+        void setPermanentBufferState(IBuffer* buffer, ResourceStates stateBits) override;
+
+        void commitBarriers() override;
+
+        ResourceStates getTextureSubresourceState(ITexture* texture, ArraySlice arraySlice, MipLevel mipLevel) override;
+        ResourceStates getBufferState(IBuffer* buffer) override;
+
+        nvrhi::IDevice* getDevice() override;
+        const CommandListParameters& getDesc() override { return m_Desc; }
+
+        // Metal3 specific methods
+        id<MTLCommandBuffer> getNativeCommandBuffer() override;
+    private:
+        const MTL3Context& m_Context;
+        
+        IDevice* m_Device;
+        
+        // i can prolly have Queue struct and pointer to object here
+        // but its not really needed, and neither does metal 3 demand it.
+        // would rather just have it inside m_Context like i have right now
+        //Queue* m_Queue;
+        UploadManager m_UploadManager;
+        
+        CommandListParameters m_Desc;
+
+        // Cache for user-provided state
+        GraphicsState m_CurrentGraphicsState;
+        ComputeState m_CurrentComputeState;
+        rt::State m_CurrentRayTracingState;
+        bool m_CurrentGraphicsStateValid = false;
+        bool m_CurrentComputeStateValid = false;
+        bool m_BindingStatesDirty = false;
+
+        // Cache for internal state
+
+        // not really tracked, cuz metal buffers expire once they commit
+        // kept for convenience (TODO?)
+        id<MTLCommandBuffer> trackedCmdBuffer;
+        id<MTLRenderCommandEncoder> m_RenderEncoder = nil;
+        id<MTLComputeCommandEncoder> m_ComputeEncoder = nil;
+        std::vector<id<MTLBuffer>> m_ReferencedNativeBuffers;
+        std::vector<id<MTLResource>> m_ReferencedNativeResources;
+        std::array<uint8_t, c_MaxPushConstantSize> m_PushConstants{};
+        size_t m_PushConstantSize = 0;
+
+        void endEncoding();
+        id<MTLRenderCommandEncoder> getOrCreateRenderEncoder();
+        id<MTLComputeCommandEncoder> getOrCreateComputeEncoder();
+        void applyGraphicsStateToEncoder(id<MTLRenderCommandEncoder> encoder, const GraphicsState& state);
+        void applyGraphicsBindings(id<MTLRenderCommandEncoder> encoder, const GraphicsState& state);
+        void applyComputeBindings(id<MTLComputeCommandEncoder> encoder, const ComputeState& state);
+        void referenceResource(IResource* resource);
+    };
+
     // metal3 device
     /* 
      * device functions declarations of virtual nvrhi functions declared in nvrhi.h
