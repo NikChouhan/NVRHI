@@ -8,8 +8,10 @@
 #include <dispatch/dispatch.h>
 #include <array>
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace nvrhi::metal3 
@@ -84,12 +86,42 @@ namespace nvrhi::metal3
         void warning(const std::string& message) const;
         void info(const std::string& message) const;
     };
+    
+    // basically a little allocator for temp CPU written, GPU read upload memory
+    struct UploadAllocation
+    {
+        id<MTLBuffer> buffer = nil;
+        NSUInteger offset = 0;
+        void* cpuAddress = nullptr;
+    };
 
-    // TODO: stub for now
     class UploadManager
     {
     public:
         UploadManager(const MTL3Context& context, size_t uploadChunkSize, size_t scratchMaxMem, bool isScratchBuffer);
+        void beginCommandBuffer();
+        void submitCommandBuffer(id<MTLCommandBuffer> commandBuffer);
+        UploadAllocation suballocate(size_t size, size_t alignment);
+
+    private:
+        struct Chunk
+        {
+            id<MTLBuffer> buffer = nil;
+            uint8_t* cpuAddress = nullptr;
+            size_t size = 0;
+            size_t offset = 0;
+            uint64_t lastUsedSerial = 0;
+        };
+
+        const MTL3Context& m_Context;
+        size_t m_DefaultChunkSize = 0;
+        uint64_t m_SubmittedSerial = 0;
+        uint64_t m_ActiveSerial = 0;
+        size_t m_CurrentChunk = size_t(-1);
+        std::shared_ptr<std::atomic<uint64_t>> m_CompletedSerial;
+        std::vector<Chunk> m_Chunks;
+
+        Chunk* findOrCreateChunk(size_t size, size_t alignment);
     };
 
     class Texture : public RefCounter<ITexture>
@@ -355,10 +387,9 @@ namespace nvrhi::metal3
         id<MTLCommandBuffer> trackedCmdBuffer;
         id<MTLRenderCommandEncoder> m_RenderEncoder = nil;
         id<MTLComputeCommandEncoder> m_ComputeEncoder = nil;
-        std::vector<id<MTLBuffer>> m_ReferencedNativeBuffers;
-        std::vector<id<MTLResource>> m_ReferencedNativeResources;
         std::array<uint8_t, c_MaxPushConstantSize> m_PushConstants{};
         size_t m_PushConstantSize = 0;
+        std::unordered_map<Buffer*, UploadAllocation> m_VolatileBufferAllocations;
 
         void endEncoding();
         id<MTLRenderCommandEncoder> getOrCreateRenderEncoder();

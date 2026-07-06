@@ -10,6 +10,9 @@ namespace nvrhi::metal3
         Buffer* buffer = new Buffer();
         buffer->desc = d;
 
+        if (d.isVolatile)
+            return BufferHandle::Create(buffer);
+
         MTLResourceOptions options = convertCpuAccess(d.cpuAccess);
         buffer->buffer = [m_Context.device newBufferWithLength:NSUInteger(d.byteSize) options:options];
         if (!buffer->buffer)

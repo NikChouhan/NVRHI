@@ -11,6 +11,119 @@
 
 namespace nvrhi::metal3 
 {
+    static size_t alignUp(size_t value, size_t alignment)
+    {
+        if (alignment <= 1)
+            return value;
+        return (value + alignment - 1) & ~(alignment - 1);
+    }
+
+    // specify default chunk size a 4MB minimum
+    // m_CompletedSerial tracks which submitted command buffers have finished on the GPU
+    UploadManager::UploadManager(const MTL3Context& context, size_t uploadChunkSize, size_t scratchMaxMem, bool isScratchBuffer)
+        : m_Context(context)
+        , m_DefaultChunkSize(std::max<size_t>(uploadChunkSize, 4 * 1024 * 1024))
+        , m_CompletedSerial(std::make_shared<std::atomic<uint64_t>>(0))
+    {
+        (void)scratchMaxMem;
+        (void)isScratchBuffer;
+    }
+    // called, from cmdList.open, and every upload allocation made during this command (when cmdList open) list gets tagged with m_ActiveSerial
+    void UploadManager::beginCommandBuffer()
+    {
+        m_ActiveSerial = ++m_SubmittedSerial;
+        m_CurrentChunk = size_t(-1);
+    }
+    /*
+     * called from CommandList::close() before commit.
+     * It attaches a Metal completion handler: `[commandBuffer addCompletedHandler:...]`
+     * When the GPU finishes this command buffer, it updates: `m_CompletedSerial = submittedSerial;`
+    */
+    void UploadManager::submitCommandBuffer(id<MTLCommandBuffer> commandBuffer)
+    {
+        if (!commandBuffer || m_ActiveSerial == 0)
+            return;
+
+        const uint64_t submittedSerial = m_ActiveSerial;
+        std::shared_ptr<std::atomic<uint64_t>> completedSerial = m_CompletedSerial;
+        [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer>) {
+            uint64_t previousValue = completedSerial->load(std::memory_order_relaxed);
+            while (previousValue < submittedSerial &&
+                !completedSerial->compare_exchange_weak(previousValue, submittedSerial,
+                    std::memory_order_release, std::memory_order_relaxed))
+            {
+            }
+        }];
+    }
+
+    /*
+     * this finds a chunk with enough free space, or creates a new one.
+    */
+    UploadManager::Chunk* UploadManager::findOrCreateChunk(size_t size, size_t alignment)
+    {
+        if (m_CurrentChunk != size_t(-1))
+        {
+            Chunk& chunk = m_Chunks[m_CurrentChunk];
+            // try the current chunk it it has room for data, if yes return chunk*
+            if (alignUp(chunk.offset, alignment) + size <= chunk.size)
+                return &chunk;
+        }
+
+        const uint64_t completedSerial = m_CompletedSerial->load(std::memory_order_acquire);
+        for (size_t index = 0; index < m_Chunks.size(); ++index)
+        {
+            Chunk& chunk = m_Chunks[index];
+            // try if the old chunks are free now, checked with the GPU sync; if yes return chunk
+            if (chunk.lastUsedSerial <= completedSerial && size <= chunk.size)
+            {
+                chunk.offset = 0;
+                m_CurrentChunk = index;
+                return &chunk;
+            }
+        }
+
+        // if no free chunk found, create a new MTL buffer with the m_DefaultChunkSize, and return chunk from that memory
+        const size_t chunkSize = std::max(m_DefaultChunkSize, alignUp(size, alignment));
+        id<MTLBuffer> buffer = [m_Context.device newBufferWithLength:NSUInteger(chunkSize) options:MTLResourceStorageModeShared];
+        if (!buffer)
+        {
+            m_Context.error("[nvrhi] Failed to allocate Metal upload chunk.");
+            return nullptr;
+        }
+
+        Chunk chunk;
+        chunk.buffer = buffer;
+        chunk.cpuAddress = static_cast<uint8_t*>([buffer contents]);
+        chunk.size = chunkSize;
+        m_Chunks.push_back(chunk);
+        m_CurrentChunk = m_Chunks.size() - 1;
+        return &m_Chunks.back();
+    }
+
+    // public allocater, used for asking chunks
+    UploadAllocation UploadManager::suballocate(size_t size, size_t alignment)
+    {
+        UploadAllocation allocation;
+        if (size == 0)
+            return allocation;
+
+        if (m_ActiveSerial == 0)
+            beginCommandBuffer();
+
+        Chunk* chunk = findOrCreateChunk(size, alignment);
+        if (!chunk)
+            return allocation;
+
+        const size_t offset = alignUp(chunk->offset, alignment);
+        allocation.buffer = chunk->buffer;
+        allocation.offset = NSUInteger(offset);
+        allocation.cpuAddress = chunk->cpuAddress + offset;
+
+        chunk->offset = offset + size;
+        chunk->lastUsedSerial = m_ActiveSerial;
+        return allocation;
+    }
+
     CommandList::CommandList(class Device* device, const MTL3Context& context, const CommandListParameters& params)
         : m_Context(context)
             , m_Device(device)
@@ -33,6 +146,8 @@ namespace nvrhi::metal3
     // crates a new command buffer, invalidates compute and graphics state, and the encoders
     void CommandList::open()
     {
+        m_UploadManager.beginCommandBuffer();
+        m_VolatileBufferAllocations.clear();
         trackedCmdBuffer = [m_Context.commonQueue commandBuffer];
         m_CurrentGraphicsStateValid = false;
         m_CurrentComputeStateValid = false;
@@ -43,8 +158,7 @@ namespace nvrhi::metal3
     void CommandList::close()
     {
         endEncoding();
-        const MTL3Context* context = &m_Context;
-        
+        m_UploadManager.submitCommandBuffer(trackedCmdBuffer);
         [trackedCmdBuffer commit];
     }
 
@@ -143,6 +257,15 @@ namespace nvrhi::metal3
         [blit endEncoding];
     }
 
+    /*
+     * writeTexture computes packed row layout, asks for upload memory, writes rows into it, then does:
+        copyFromBuffer:upload.buffer
+        sourceOffset:upload.offset
+        sourceBytesPerRow:naturalRowPitch
+        sourceBytesPerImage:naturalBytesPerImage
+        toTexture:texture->texture
+     * So textures also avoid per-upload Metal buffer allocation.
+    */
     void CommandList::writeTexture(ITexture* dest, uint32_t arraySlice, uint32_t mipLevel, const void* data, size_t rowPitch, size_t depthPitch)
     {
         auto* texture = static_cast<Texture*>(dest);
@@ -180,14 +303,14 @@ namespace nvrhi::metal3
             return;
 
         const size_t copySize = naturalBytesPerImage * mipDepth;
-        id<MTLBuffer> upload = [m_Context.device newBufferWithLength:copySize options:MTLResourceStorageModeShared];
-        if (!upload)
+        UploadAllocation upload = m_UploadManager.suballocate(copySize, 256);
+        if (!upload.buffer || !upload.cpuAddress)
             return;
 
         // pack only the meaningful row bytes into the upload buffer. The caller's
         // rows/depth slices may include padding, while the Metal copy below uses a
         // tightly packed sourceBytesPerRow/sourceBytesPerImage layout.
-        auto* destBytes = static_cast<uint8_t*>([upload contents]);
+        auto* destBytes = static_cast<uint8_t*>(upload.cpuAddress);
         const auto* srcBytes = static_cast<const uint8_t*>(data);
         for (uint32_t z = 0; z < mipDepth; ++z)
         {
@@ -199,11 +322,10 @@ namespace nvrhi::metal3
             }
         }
 
-        m_ReferencedNativeBuffers.push_back(upload);
         endEncoding();
         id<MTLBlitCommandEncoder> blit = [trackedCmdBuffer blitCommandEncoder];
-        [blit copyFromBuffer:upload
-                 sourceOffset:0
+        [blit copyFromBuffer:upload.buffer
+                 sourceOffset:upload.offset
             sourceBytesPerRow:naturalRowPitch
           sourceBytesPerImage:naturalBytesPerImage
                    sourceSize:MTLSizeMake(mipWidth, mipHeight, mipDepth)
@@ -260,5 +382,45 @@ namespace nvrhi::metal3
                 [encoder endEncoding];
             }
         }
+    }
+    void CommandList::writeBuffer(IBuffer* b, const void* data, size_t dataSize, uint64_t destOffsetBytes)
+    {
+        auto* buffer = static_cast<Buffer*>(b);
+        if (!buffer || !data || dataSize == 0)
+            return;
+
+        if (destOffsetBytes > buffer->desc.byteSize || dataSize > buffer->desc.byteSize - destOffsetBytes)
+            return;
+
+        // if isVolatile, write into the CPU-GPU shared mem directly and return
+        if (buffer->desc.isVolatile)
+        {
+            UploadAllocation allocation = m_UploadManager.suballocate(dataSize, 256);
+            if (!allocation.buffer || !allocation.cpuAddress)
+                return;
+
+            memcpy(allocation.cpuAddress, data, dataSize);
+            m_VolatileBufferAllocations[buffer] = allocation;
+            return;
+        }
+
+        if (!buffer->buffer)
+            return;
+
+        // if not volatile, for normal buffer, CPU writes into upload shared memory, and then perform blit op
+        UploadAllocation upload = m_UploadManager.suballocate(dataSize, 256);
+        if (!upload.buffer || !upload.cpuAddress)
+            return;
+
+        memcpy(upload.cpuAddress, data, dataSize);
+
+        endEncoding();
+        id<MTLBlitCommandEncoder> blit = [trackedCmdBuffer blitCommandEncoder];
+        [blit copyFromBuffer:upload.buffer
+                sourceOffset:upload.offset
+                    toBuffer:buffer->buffer
+           destinationOffset:NSUInteger(destOffsetBytes)
+                        size:NSUInteger(dataSize)];
+        [blit endEncoding];
     }
 }

@@ -22,6 +22,7 @@ namespace nvrhi::metal3
         switch (cpuAccess)
         {
         case CpuAccessMode::None:
+            return MTLResourceStorageModePrivate;
         case CpuAccessMode::Read:
         case CpuAccessMode::Write:
             return MTLResourceStorageModeShared;
