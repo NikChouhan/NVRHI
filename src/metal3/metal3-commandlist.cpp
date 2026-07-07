@@ -423,4 +423,93 @@ namespace nvrhi::metal3
                         size:NSUInteger(dataSize)];
         [blit endEncoding];
     }
+
+    void CommandList::clearBufferUInt(IBuffer* b, uint32_t clearValue)
+    {
+        auto* buffer = static_cast<Buffer*>(b);
+        if (!buffer || !buffer->buffer)
+            return;
+
+        const size_t clearSize = size_t(buffer->desc.byteSize);
+        if (clearSize == 0)
+            return;
+
+        if (clearValue == 0)
+        {
+            // This clear must be ordered with later GPU work. CPU writes into a
+            // shared buffer can race already-encoded dispatches, which lets GPU
+            // append counters accumulate across culling passes. A blit fill is
+            // recorded in the command buffer, so Metal executes it before the
+            // following compute encoder.
+            endEncoding();
+            id<MTLBlitCommandEncoder> blit = [trackedCmdBuffer blitCommandEncoder];
+            [blit fillBuffer:buffer->buffer
+                       range:NSMakeRange(0, NSUInteger(buffer->desc.byteSize))
+                       value:0];
+            [blit endEncoding];
+            return;
+        }
+        // repeatable pattern does the same style blit
+        const uint8_t bytePattern = uint8_t(clearValue & 0xffu);
+        const bool isRepeatedBytePattern = clearValue == uint32_t(bytePattern) * 0x01010101u;
+        if (isRepeatedBytePattern)
+        {
+            endEncoding();
+            id<MTLBlitCommandEncoder> blit = [trackedCmdBuffer blitCommandEncoder];
+            [blit fillBuffer:buffer->buffer
+                       range:NSMakeRange(0, NSUInteger(clearSize))
+                       value:bytePattern];
+            [blit endEncoding];
+            return;
+        }
+
+        // if no repeatable pattern, perform the copy from buffer with UploadManager
+        const size_t wordCount = clearSize / sizeof(uint32_t);
+        const size_t uploadSize = wordCount * sizeof(uint32_t);
+        if (uploadSize == 0)
+            return;
+
+        UploadAllocation upload = m_UploadManager.suballocate(uploadSize, 256);
+        if (!upload.buffer || !upload.cpuAddress)
+            return;
+
+        uint32_t* words = static_cast<uint32_t*>(upload.cpuAddress);
+        for (size_t i = 0; i < wordCount; ++i)
+            words[i] = clearValue;
+
+        endEncoding();
+        id<MTLBlitCommandEncoder> blit = [trackedCmdBuffer blitCommandEncoder];
+        [blit copyFromBuffer:upload.buffer
+                sourceOffset:upload.offset
+                    toBuffer:buffer->buffer
+           destinationOffset:0
+                        size:NSUInteger(uploadSize)];
+        [blit endEncoding];
+    }
+
+    void CommandList::copyBuffer(IBuffer* dest, uint64_t destOffsetBytes, IBuffer* src, uint64_t srcOffsetBytes, uint64_t dataSizeBytes)
+    {
+        auto* d = static_cast<Buffer*>(dest);
+        auto* s = static_cast<Buffer*>(src);
+        if (!d || !s || !d->buffer || !s->buffer || dataSizeBytes == 0)
+            return;
+        // volatile buffers should always be handled with cmdList.writeBuffer, not copyBuffer
+        if (d->desc.isVolatile || s->desc.isVolatile)
+            return;
+
+        if (srcOffsetBytes > s->desc.byteSize || dataSizeBytes > s->desc.byteSize - srcOffsetBytes)
+            return;
+
+        if (destOffsetBytes > d->desc.byteSize || dataSizeBytes > d->desc.byteSize - destOffsetBytes)
+            return;
+
+        endEncoding();
+        id<MTLBlitCommandEncoder> blit = [trackedCmdBuffer blitCommandEncoder];
+        [blit copyFromBuffer:s->buffer
+                sourceOffset:NSUInteger(srcOffsetBytes)
+                    toBuffer:d->buffer
+           destinationOffset:NSUInteger(destOffsetBytes)
+                        size:NSUInteger(dataSizeBytes)];
+        [blit endEncoding];
+    }
 }
