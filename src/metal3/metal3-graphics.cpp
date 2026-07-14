@@ -164,6 +164,10 @@ namespace nvrhi::metal3
         pipeline->primitiveType = convertPrimitiveType(desc.primType);
         pipeline->cullMode = convertCullMode(desc.renderState.rasterState.cullMode);
         pipeline->frontWinding = convertWinding(desc.renderState.rasterState.frontCounterClockwise);
+        // create vertex and fragment plan
+        pipeline->vertexBindingPlan = resolveMetalStageBindingPlan(vs->reflectedBindingPlan, desc.bindingLayouts);
+        if (ps)
+            pipeline->fragmentBindingPlan = resolveMetalStageBindingPlan(ps->reflectedBindingPlan, desc.bindingLayouts);
         return GraphicsPipelineHandle::Create(pipeline);
     }
 

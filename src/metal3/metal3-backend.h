@@ -60,6 +60,27 @@ namespace nvrhi::metal3
         std::vector<MscArgumentBinding> topLevelArgumentBuffer;
         std::unordered_map<std::string, uint32_t> vertexInputAttributes;
     };
+    // shader reflected data, first part basically the MscArgumentBinding i,e per resource
+    struct MetalBindingPlanEntry
+    {
+        uint32_t argumentIndex = 0;
+        uint32_t slot = 0;
+        uint32_t space = 0;
+        MscArgumentType argumentType = MscArgumentType::SRV;
+
+        uint32_t layoutIndex = ~0u;
+        uint32_t layoutItemIndex = ~0u;
+        ResourceType layoutType = ResourceType::None;
+        bool layoutMatched = false;
+    };
+    // per shader stage binding plan; entries -> per resource plan
+    struct MetalStageBindingPlan
+    {
+        ShaderType stage = ShaderType::None;
+        bool valid = false;
+        uint32_t resourceCount = 0;
+        std::vector<MetalBindingPlanEntry> entries;
+    };
 
     // implementation in metal3-constants.cpp
     MTLTextureType convertTextureDimension(TextureDimension dimension, uint32_t sampleCount);
@@ -86,6 +107,10 @@ namespace nvrhi::metal3
         void warning(const std::string& message) const;
         void info(const std::string& message) const;
     };
+    // created at time of shader creation, using reflection data
+    MetalStageBindingPlan createMetalStageBindingPlan(ShaderType stage, const MscShaderReflection& reflection);
+    // resolve at pipeline creation per stage
+    MetalStageBindingPlan resolveMetalStageBindingPlan(const MetalStageBindingPlan& reflectedPlan, const BindingLayoutVector& pipelineLayouts);
     
     // basically a little allocator for temp CPU written, GPU read upload memory
     struct UploadAllocation
@@ -93,6 +118,26 @@ namespace nvrhi::metal3
         id<MTLBuffer> buffer = nil;
         NSUInteger offset = 0;
         void* cpuAddress = nullptr;
+    };
+
+    // metal resource cache per nvrhi binding item
+    struct MetalBindingResource
+    {
+        ResourceType type = ResourceType::None;
+        uint32_t slot = 0;
+        uint32_t arrayElement = 0;
+        uint32_t registerSpace = 0;
+
+        ResourceHandle resource;
+
+        id<MTLTexture> texture = nil;
+        id<MTLBuffer> buffer = nil;
+        NSUInteger bufferOffset = 0;
+        NSUInteger bufferSize = 0;
+        id<MTLSamplerState> sampler = nil;
+        float samplerMipBias = 0.f;
+
+        MTLResourceUsage usage = MTLResourceUsageRead;
     };
 
     class UploadManager
@@ -166,6 +211,7 @@ namespace nvrhi::metal3
         id<MTLFunction> function = nil;
         std::vector<uint8_t> bytecode;
         MscShaderReflection mscReflection;
+        MetalStageBindingPlan reflectedBindingPlan;
         MTLSize computeThreadsPerGroup = MTLSizeMake(1, 1, 1);
         bool computeThreadsPerGroupValid = false;
 
@@ -219,6 +265,10 @@ namespace nvrhi::metal3
         MTLPrimitiveType primitiveType = MTLPrimitiveTypeTriangle;
         MTLCullMode cullMode = MTLCullModeNone;
         MTLWinding frontWinding = MTLWindingClockwise;
+        MetalStageBindingPlan vertexBindingPlan;
+        MetalStageBindingPlan fragmentBindingPlan;
+        // TODO: for mesh shaders
+        MetalStageBindingPlan meshBindingPlan;
         const GraphicsPipelineDesc& getDesc() const override { return desc; }
         const FramebufferInfo& getFramebufferInfo() const override { return framebufferInfo; }
         Object getNativeObject(ObjectType objectType) override;
@@ -230,6 +280,7 @@ namespace nvrhi::metal3
         ComputePipelineDesc desc;
         id<MTLComputePipelineState> pipeline = nil;
         MTLSize threadsPerGroup = MTLSizeMake(1, 1, 1);
+        MetalStageBindingPlan computeBindingPlan;
         const ComputePipelineDesc& getDesc() const override { return desc; }
         Object getNativeObject(ObjectType objectType) override;
     };
@@ -249,6 +300,9 @@ namespace nvrhi::metal3
     public:
         BindingSetDesc desc;
         BindingLayoutHandle layout;
+        std::vector<ResourceHandle> resources;
+        std::vector<MetalBindingResource> entries;
+        uint64_t version = 1;
         const BindingSetDesc* getDesc() const override { return &desc; }
         IBindingLayout* getLayout() const override { return layout; }
     };

@@ -38,6 +38,7 @@ namespace nvrhi::metal3
             //     "' missing numthreads metadata; using " +
             //     std::to_string(pipeline->threadsPerGroup.width) + "x1x1 fallback");
         }
+        pipeline->computeBindingPlan = resolveMetalStageBindingPlan(cs->reflectedBindingPlan, desc.bindingLayouts);
         return ComputePipelineHandle::Create(pipeline);
     }
 

@@ -253,6 +253,7 @@ namespace nvrhi::metal3
         {
             m_Context.warning("[metal3] shader '" + d.debugName + "' has no MSC reflection; using legacy argument-buffer ordering");
         }
+        shader->reflectedBindingPlan = createMetalStageBindingPlan(d.shaderType, shader->mscReflection);
 
         if (d.shaderType == ShaderType::Compute)
         {
