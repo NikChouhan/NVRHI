@@ -355,8 +355,16 @@ namespace nvrhi::metal3
         void setPushConstants(const void* data, size_t byteSize) override;
 
         void setGraphicsState(const GraphicsState& state) override;
+        // for draw* commands:
+        /* 
+        // Metal Shader Converter vertex shaders read draw parameters from
+        // the IR runtime bind points. Use the runtime wrapper for indirect
+        // draws too; raw Metal draws do not populate those translated
+        // D3D-style draw parameter bindings.
+        */
         void draw(const DrawArguments& args) override;
         void drawIndexed(const DrawArguments& args) override;
+        
         void drawIndirect(uint32_t offsetBytes, uint32_t drawCount) override;
         void drawIndexedIndirect(uint32_t offsetBytes, uint32_t drawCount) override;
         void drawIndexedIndirectCount(uint32_t paramOffsetBytes, uint32_t countOffsetBytes, uint32_t maxDrawCount) override;

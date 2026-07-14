@@ -11,6 +11,15 @@
 
 namespace nvrhi::metal3 
 {
+    static bool traceMetalRuntime()
+    {
+        static bool enabled = [] {
+            const char* value = std::getenv("LDV_METAL3_TRACE");
+            return !value || std::string(value) != "0";
+        }();
+        return enabled;
+    }
+
     static size_t alignUp(size_t value, size_t alignment)
     {
         if (alignment <= 1)
@@ -511,5 +520,78 @@ namespace nvrhi::metal3
            destinationOffset:NSUInteger(destOffsetBytes)
                         size:NSUInteger(dataSizeBytes)];
         [blit endEncoding];
+    }
+
+    id<MTLRenderCommandEncoder> CommandList::getOrCreateRenderEncoder()
+    {
+        if (m_RenderEncoder)
+            return m_RenderEncoder;
+        endEncoding();
+
+        auto* framebuffer = static_cast<Framebuffer*>(m_CurrentGraphicsState.framebuffer);
+        if (!framebuffer)
+        {
+            if (traceMetalRuntime())
+                m_Context.warning("[metal3-trace] render encoder requested without framebuffer");
+            return nil;
+        }
+
+        MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        for (NSUInteger index = 0; index < framebuffer->desc.colorAttachments.size(); ++index)
+        {
+            const auto& attachment = framebuffer->desc.colorAttachments[index];
+            auto* texture = static_cast<Texture*>(framebuffer->desc.colorAttachments[index].texture);
+            rp.colorAttachments[index].texture = texture ? texture->texture : nil;
+            rp.colorAttachments[index].level = attachment.subresources.baseMipLevel;
+            rp.colorAttachments[index].slice = attachment.subresources.baseArraySlice;
+            rp.colorAttachments[index].loadAction = MTLLoadActionLoad;
+            rp.colorAttachments[index].storeAction = MTLStoreActionStore;
+        }
+        if (framebuffer->desc.depthAttachment.texture)
+        {
+            const auto& attachment = framebuffer->desc.depthAttachment;
+            auto* depth = static_cast<Texture*>(framebuffer->desc.depthAttachment.texture);
+            rp.depthAttachment.texture = depth ? depth->texture : nil;
+            rp.depthAttachment.level = attachment.subresources.baseMipLevel;
+            rp.depthAttachment.slice = attachment.subresources.baseArraySlice;
+            rp.depthAttachment.loadAction = MTLLoadActionLoad;
+            rp.depthAttachment.storeAction = MTLStoreActionStore;
+        }
+
+        m_RenderEncoder = [trackedCmdBuffer renderCommandEncoderWithDescriptor:rp];
+        if (!m_RenderEncoder)
+            m_Context.error("[metal3-trace] failed to create render command encoder");
+        return m_RenderEncoder;
+    }
+    
+    void CommandList::draw(const DrawArguments& args)
+    {
+        if (!m_CurrentGraphicsStateValid)
+            return;
+        id<MTLRenderCommandEncoder> encoder = getOrCreateRenderEncoder();
+        auto* pipeline = static_cast<GraphicsPipeline*>(m_CurrentGraphicsState.pipeline);
+        if (!encoder || !pipeline)
+        {
+            if (traceMetalRuntime())
+                m_Context.warning("[metal3-trace] draw skipped: encoder/pipeline missing");
+            return;
+        }
+        IRRuntimeDrawPrimitives(encoder, pipeline->primitiveType, args.startVertexLocation, args.vertexCount, args.instanceCount, args.startInstanceLocation);
+    }
+
+    void CommandList::drawIndexed(const DrawArguments& args)
+    {
+        if (!m_CurrentGraphicsStateValid)
+            return;
+        id<MTLRenderCommandEncoder> encoder = getOrCreateRenderEncoder();
+        auto* pipeline = static_cast<GraphicsPipeline*>(m_CurrentGraphicsState.pipeline);
+        auto* indexBuffer = static_cast<Buffer*>(m_CurrentGraphicsState.indexBuffer.buffer);
+        if (!encoder || !pipeline || !indexBuffer)
+        {
+            if (traceMetalRuntime())
+                m_Context.warning("[metal3-trace] drawIndexed skipped: encoder/pipeline/index missing");
+            return;
+        }
+        IRRuntimeDrawIndexedPrimitives(encoder, pipeline->primitiveType, args.vertexCount, convertIndexFormat(m_CurrentGraphicsState.indexBuffer.format), indexBuffer->buffer, m_CurrentGraphicsState.indexBuffer.offset + args.startIndexLocation * (m_CurrentGraphicsState.indexBuffer.format == Format::R32_UINT ? 4 : 2), args.instanceCount, args.startVertexLocation, args.startInstanceLocation);
     }
 }
