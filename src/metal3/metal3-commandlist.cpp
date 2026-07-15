@@ -229,7 +229,7 @@ namespace nvrhi::metal3
             break;
         }
     }
-    
+
     // similar to useArgumentTableResources (with render command encoder), but with compute command encoder 
     static void useArgumentTableResources(id<MTLComputeCommandEncoder> encoder, const BindingSetVector& bindingSets, const MetalStageBindingPlan& plan)
     {
@@ -841,6 +841,40 @@ namespace nvrhi::metal3
             return;
         }
         IRRuntimeDrawIndexedPrimitives(encoder, pipeline->primitiveType, args.vertexCount, convertIndexFormat(m_CurrentGraphicsState.indexBuffer.format), indexBuffer->buffer, m_CurrentGraphicsState.indexBuffer.offset + args.startIndexLocation * (m_CurrentGraphicsState.indexBuffer.format == Format::R32_UINT ? 4 : 2), args.instanceCount, args.startVertexLocation, args.startInstanceLocation);
+    }
+
+    void CommandList::setComputeState(const ComputeState& state)
+    {
+        m_CurrentComputeState = state;
+        m_CurrentComputeStateValid = true;
+        endEncoding();
+        id<MTLComputeCommandEncoder> encoder = getOrCreateComputeEncoder();
+        auto* pipeline = static_cast<ComputePipeline*>(state.pipeline);
+        if (!encoder || !pipeline)
+        {
+            if (traceMetalRuntime())
+                m_Context.warning("[metal3-trace] setComputeState skipped: encoder=" +
+                    std::string(encoder ? "yes" : "no") + " pipeline=" + (pipeline ? "yes" : "no"));
+            return;
+        }
+
+        [encoder setComputePipelineState:pipeline->pipeline];
+        applyComputeBindings(encoder, state);
+
+        id<MTLBuffer> argumentBuffer = getOrCreateArgumentTable(pipeline->computeBindingPlan, state.bindings);
+        if (argumentBuffer)
+        {
+            m_ReferencedNativeBuffers.push_back(argumentBuffer);
+            [encoder setBuffer:argumentBuffer offset:0 atIndex:kIRArgumentBufferBindPoint];
+            [encoder useResource:argumentBuffer usage:MTLResourceUsageRead];
+            useArgumentTableResources(encoder, state.bindings, pipeline->computeBindingPlan);
+        }
+        else if (traceMetalRuntime() && pipeline->computeBindingPlan.valid && pipeline->computeBindingPlan.resourceCount != 0)
+        {
+            static int missingComputeArgBufferLogs = 0;
+            if (missingComputeArgBufferLogs++ < 16)
+                m_Context.warning("[metal3-trace] setComputeState created no cached argument table");
+        }
     }
 
     void CommandList::applyGraphicsStateToEncoder(id<MTLRenderCommandEncoder> encoder, const GraphicsState& state)
