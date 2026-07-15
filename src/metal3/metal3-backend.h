@@ -82,6 +82,26 @@ namespace nvrhi::metal3
         std::vector<MetalBindingPlanEntry> entries;
     };
 
+    struct MetalArgumentTableCacheKey
+    {
+        const MetalStageBindingPlan* plan = nullptr;
+        std::vector<const BindingSet*> bindingSets;
+        std::vector<uint64_t> bindingSetVersions;
+
+        bool operator==(const MetalArgumentTableCacheKey& other) const
+        {
+            return plan == other.plan &&
+                bindingSets == other.bindingSets &&
+                bindingSetVersions == other.bindingSetVersions;
+        }
+    };
+
+    struct MetalArgumentTableCacheEntry
+    {
+        MetalArgumentTableCacheKey key;
+        id<MTLBuffer> argumentBuffer = nil;
+    };
+
     // implementation in metal3-constants.cpp
     MTLTextureType convertTextureDimension(TextureDimension dimension, uint32_t sampleCount);
     MTLResourceOptions convertCpuAccess(CpuAccessMode cpuAccess);
@@ -364,7 +384,7 @@ namespace nvrhi::metal3
         */
         void draw(const DrawArguments& args) override;
         void drawIndexed(const DrawArguments& args) override;
-        
+
         void drawIndirect(uint32_t offsetBytes, uint32_t drawCount) override;
         void drawIndexedIndirect(uint32_t offsetBytes, uint32_t drawCount) override;
         void drawIndexedIndirectCount(uint32_t paramOffsetBytes, uint32_t countOffsetBytes, uint32_t maxDrawCount) override;
@@ -449,6 +469,13 @@ namespace nvrhi::metal3
         id<MTLCommandBuffer> trackedCmdBuffer;
         id<MTLRenderCommandEncoder> m_RenderEncoder = nil;
         id<MTLComputeCommandEncoder> m_ComputeEncoder = nil;
+
+        std::vector<BindingSetHandle> m_ReferencedBindingSets;
+        std::vector<id<MTLBuffer>> m_ReferencedNativeBuffers;
+        std::vector<id<MTLResource>> m_ReferencedNativeResources;
+
+        std::vector<MetalArgumentTableCacheEntry> m_ArgumentTableCache;
+
         std::array<uint8_t, c_MaxPushConstantSize> m_PushConstants{};
         size_t m_PushConstantSize = 0;
         std::unordered_map<Buffer*, UploadAllocation> m_VolatileBufferAllocations;
@@ -456,10 +483,13 @@ namespace nvrhi::metal3
         void endEncoding();
         id<MTLRenderCommandEncoder> getOrCreateRenderEncoder();
         id<MTLComputeCommandEncoder> getOrCreateComputeEncoder();
+        id<MTLBuffer> getOrCreateArgumentTable(const MetalStageBindingPlan& plan, const BindingSetVector& bindingSets);
+        bool bindVolatileConstantBuffer(id<MTLRenderCommandEncoder> encoder, const BindingSetItem& item);
+        bool bindVolatileConstantBuffer(id<MTLComputeCommandEncoder> encoder, const BindingSetItem& item);
         void applyGraphicsStateToEncoder(id<MTLRenderCommandEncoder> encoder, const GraphicsState& state);
         void applyGraphicsBindings(id<MTLRenderCommandEncoder> encoder, const GraphicsState& state);
         void applyComputeBindings(id<MTLComputeCommandEncoder> encoder, const ComputeState& state);
-        void referenceResource(IResource* resource);
+        void referenceBindingSet(BindingSet* bindingSet);
     };
 
     // metal3 device

@@ -11,6 +11,11 @@
 
 namespace nvrhi::metal3 
 {
+    // taken from <metal_irconverter_runtime/metal_irconverter_runtime.h>
+    // predefined bind point values for shaders converted with metal shader converter
+    static constexpr uint32_t c_MscVertexBufferBindPoint = 6;
+    static constexpr uint32_t c_IrDrawArgumentsBindPoint = 4;
+
     static bool traceMetalRuntime()
     {
         static bool enabled = [] {
@@ -25,6 +30,231 @@ namespace nvrhi::metal3
         if (alignment <= 1)
             return value;
         return (value + alignment - 1) & ~(alignment - 1);
+    }
+
+    static const char* resourceTypeName(ResourceType type)
+    {
+        switch (type)
+        {
+        case ResourceType::Texture_SRV: return "Texture_SRV";
+        case ResourceType::Texture_UAV: return "Texture_UAV";
+        case ResourceType::TypedBuffer_SRV: return "TypedBuffer_SRV";
+        case ResourceType::TypedBuffer_UAV: return "TypedBuffer_UAV";
+        case ResourceType::StructuredBuffer_SRV: return "StructuredBuffer_SRV";
+        case ResourceType::StructuredBuffer_UAV: return "StructuredBuffer_UAV";
+        case ResourceType::RawBuffer_SRV: return "RawBuffer_SRV";
+        case ResourceType::RawBuffer_UAV: return "RawBuffer_UAV";
+        case ResourceType::ConstantBuffer: return "ConstantBuffer";
+        case ResourceType::VolatileConstantBuffer: return "VolatileConstantBuffer";
+        case ResourceType::Sampler: return "Sampler";
+        case ResourceType::None: return "None";
+        default: return "Other";
+        }
+    }
+
+    static MetalArgumentTableCacheKey makeArgumentTableCacheKey(const MetalStageBindingPlan& plan, const BindingSetVector& bindingSets)
+    {
+        MetalArgumentTableCacheKey key;
+        key.plan = &plan;
+        key.bindingSets.reserve(bindingSets.size());
+        key.bindingSetVersions.reserve(bindingSets.size());
+
+        for (IBindingSet* bindingSet : bindingSets)
+        {
+            auto* set = static_cast<BindingSet*>(bindingSet);
+            key.bindingSets.push_back(set);
+            key.bindingSetVersions.push_back(set ? set->version : 0);
+        }
+
+        return key;
+    }
+
+    static bool usesDirectVolatileConstantBufferBinding(const MetalBindingPlanEntry& planEntry)
+    {
+        return planEntry.layoutMatched &&
+            planEntry.argumentType == MscArgumentType::CBV &&
+            planEntry.layoutType == ResourceType::VolatileConstantBuffer;
+    }
+
+    static bool isSrvType(ResourceType type)
+    {
+        return type == ResourceType::Texture_SRV ||
+            type == ResourceType::TypedBuffer_SRV ||
+            type == ResourceType::StructuredBuffer_SRV ||
+            type == ResourceType::RawBuffer_SRV;
+    }
+
+    static bool isUavType(ResourceType type)
+    {
+        return type == ResourceType::Texture_UAV ||
+            type == ResourceType::TypedBuffer_UAV ||
+            type == ResourceType::StructuredBuffer_UAV ||
+            type == ResourceType::RawBuffer_UAV;
+    }
+
+    static bool isBufferType(ResourceType type)
+    {
+        return type == ResourceType::ConstantBuffer ||
+            type == ResourceType::VolatileConstantBuffer ||
+            type == ResourceType::TypedBuffer_SRV ||
+            type == ResourceType::TypedBuffer_UAV ||
+            type == ResourceType::StructuredBuffer_SRV ||
+            type == ResourceType::StructuredBuffer_UAV ||
+            type == ResourceType::RawBuffer_SRV ||
+            type == ResourceType::RawBuffer_UAV;
+    }
+
+    static bool matchesMscArgumentType(ResourceType resourceType, MscArgumentType argumentType)
+    {
+        switch (argumentType)
+        {
+        case MscArgumentType::SRV:
+            return isSrvType(resourceType);
+        case MscArgumentType::UAV:
+            return isUavType(resourceType);
+        case MscArgumentType::CBV:
+            return resourceType == ResourceType::ConstantBuffer || resourceType == ResourceType::VolatileConstantBuffer;
+        case MscArgumentType::Sampler:
+            return resourceType == ResourceType::Sampler;
+        }
+
+        return false;
+    }
+
+    // Metal binding model:
+    // - regular CB/SRV/UAV/sampler bindings are encoded into Metal Shader
+    //   Converter descriptor tables using the reflected per-stage plan.
+    // - volatile constant buffers are command-list dynamic; writeBuffer()
+    //   suballocates upload memory, and the current allocation is bound
+    //   directly to the translated b# slot. They are intentionally excluded
+    //   from cached argument tables so writes do not have to invalidate them.
+    // - vertex, index, indirect, helper, and argument-table buffers remain
+    //   direct Metal bindings because they are not ordinary shader resources.
+    static const MetalBindingResource* findArgumentTableResource(
+        const BindingSetVector& bindingSets,
+        const MetalBindingPlanEntry& planEntry)
+    {
+        if (usesDirectVolatileConstantBufferBinding(planEntry))
+            return nullptr;
+
+        if (!planEntry.layoutMatched || planEntry.layoutIndex >= bindingSets.size())
+            return nullptr;
+
+        auto* set = static_cast<BindingSet*>(bindingSets[planEntry.layoutIndex]);
+        if (!set)
+            return nullptr;
+
+        for (const MetalBindingResource& entry : set->entries)
+        {
+            if (entry.type == ResourceType::None ||
+                entry.type == ResourceType::VolatileConstantBuffer ||
+                entry.type == ResourceType::SamplerFeedbackTexture_UAV ||
+                !matchesMscArgumentType(entry.type, planEntry.argumentType))
+                continue;
+
+            if (entry.slot + entry.arrayElement == planEntry.slot)
+                return &entry;
+        }
+
+        return nullptr;
+    }
+
+    static void encodeArgumentTableEntry(IRDescriptorTableEntry* entry, const MetalBindingResource& resource)
+    {
+        switch (resource.type)
+        {
+        case ResourceType::Texture_SRV:
+        case ResourceType::Texture_UAV:
+            if (resource.texture)
+                IRDescriptorTableSetTexture(entry, resource.texture, 0.f, 0);
+            break;
+        case ResourceType::Sampler:
+            if (resource.sampler)
+                IRDescriptorTableSetSampler(entry, resource.sampler, resource.samplerMipBias);
+            break;
+        case ResourceType::ConstantBuffer:
+        case ResourceType::TypedBuffer_SRV:
+        case ResourceType::TypedBuffer_UAV:
+        case ResourceType::StructuredBuffer_SRV:
+        case ResourceType::StructuredBuffer_UAV:
+        case ResourceType::RawBuffer_SRV:
+        case ResourceType::RawBuffer_UAV:
+        {
+            if (!resource.buffer)
+                break;
+
+            IRBufferView view{};
+            view.buffer = resource.buffer;
+            view.bufferOffset = resource.bufferOffset;
+            view.bufferSize = resource.bufferSize;
+            view.textureBufferView = nil;
+            view.textureViewOffsetInElements = 0;
+            view.typedBuffer = false;
+            IRDescriptorTableSetBufferView(entry, &view);
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
+    static void useArgumentTableResource(id<MTLComputeCommandEncoder> encoder, const MetalBindingResource& resource)
+    {
+        switch (resource.type)
+        {
+        case ResourceType::Texture_SRV:
+        case ResourceType::Texture_UAV:
+            if (resource.texture)
+                [encoder useResource:resource.texture usage:resource.usage];
+            break;
+        default:
+            if (isBufferType(resource.type) && resource.buffer)
+                [encoder useResource:resource.buffer usage:resource.usage];
+            break;
+        }
+    }
+
+    static void useArgumentTableResource(id<MTLRenderCommandEncoder> encoder, const MetalBindingResource& resource, MTLRenderStages stages)
+    {
+        switch (resource.type)
+        {
+        case ResourceType::Texture_SRV:
+        case ResourceType::Texture_UAV:
+            if (resource.texture)
+                [encoder useResource:resource.texture usage:resource.usage stages:stages];
+            break;
+        default:
+            if (isBufferType(resource.type) && resource.buffer)
+                [encoder useResource:resource.buffer usage:resource.usage stages:stages];
+            break;
+        }
+    }
+    
+    // similar to useArgumentTableResources (with render command encoder), but with compute command encoder 
+    static void useArgumentTableResources(id<MTLComputeCommandEncoder> encoder, const BindingSetVector& bindingSets, const MetalStageBindingPlan& plan)
+    {
+        for (const MetalBindingPlanEntry& planEntry : plan.entries)
+        {
+            const MetalBindingResource* resource = findArgumentTableResource(bindingSets, planEntry);
+            if (resource)
+                useArgumentTableResource(encoder, *resource);
+        }
+    }
+
+    // After the descriptor table buffer is bound, tell Metal which native
+    // resources the table may reference for this render stage. Encoding the
+    // IRDescriptorTableEntry values makes the resources visible to the
+    // translated shader; useResource gives Metal explicit usage/stage
+    // information for hazard tracking, especially for resources reached
+    // indirectly through the table.
+    static void useArgumentTableResources(id<MTLRenderCommandEncoder> encoder, const BindingSetVector& bindingSets, const MetalStageBindingPlan& plan, MTLRenderStages stages)
+    {
+        for (const MetalBindingPlanEntry& planEntry : plan.entries)
+        {
+            const MetalBindingResource* resource = findArgumentTableResource(bindingSets, planEntry);
+            if (resource)
+                useArgumentTableResource(encoder, *resource, stages);
+        }
     }
 
     // specify default chunk size a 4MB minimum
@@ -522,6 +752,24 @@ namespace nvrhi::metal3
         [blit endEncoding];
     }
 
+    void CommandList::setGraphicsState(const GraphicsState& state)
+    {
+        m_CurrentGraphicsState = state;
+        m_CurrentGraphicsStateValid = true;
+        endEncoding();
+        id<MTLRenderCommandEncoder> encoder = getOrCreateRenderEncoder();
+        auto* pipeline = static_cast<GraphicsPipeline*>(state.pipeline);
+        if (!encoder || !pipeline)
+        {
+            if (traceMetalRuntime())
+                m_Context.warning("[metal3-trace] setGraphicsState skipped: encoder=" +
+                    std::string(encoder ? "yes" : "no") + " pipeline=" + (pipeline ? "yes" : "no"));
+            return;
+        }
+
+        applyGraphicsStateToEncoder(encoder, state);
+    }
+
     id<MTLRenderCommandEncoder> CommandList::getOrCreateRenderEncoder()
     {
         if (m_RenderEncoder)
@@ -594,4 +842,210 @@ namespace nvrhi::metal3
         }
         IRRuntimeDrawIndexedPrimitives(encoder, pipeline->primitiveType, args.vertexCount, convertIndexFormat(m_CurrentGraphicsState.indexBuffer.format), indexBuffer->buffer, m_CurrentGraphicsState.indexBuffer.offset + args.startIndexLocation * (m_CurrentGraphicsState.indexBuffer.format == Format::R32_UINT ? 4 : 2), args.instanceCount, args.startVertexLocation, args.startInstanceLocation);
     }
+
+    void CommandList::applyGraphicsStateToEncoder(id<MTLRenderCommandEncoder> encoder, const GraphicsState& state)
+    {
+        auto* pipeline = static_cast<GraphicsPipeline*>(state.pipeline);
+        if (!encoder || !pipeline)
+            return;
+
+        [encoder setRenderPipelineState:pipeline->pipeline];
+        [encoder setDepthStencilState:pipeline->depthStencilState];
+        [encoder setCullMode:pipeline->cullMode];
+        [encoder setFrontFacingWinding:pipeline->frontWinding];
+
+        for (const Viewport& vp : state.viewport.viewports)
+            [encoder setViewport:MTLViewport{ vp.minX, vp.minY, vp.width(), vp.height(), vp.minZ, vp.maxZ }];
+        for (const Rect& rect : state.viewport.scissorRects)
+            [encoder setScissorRect:MTLScissorRect{ NSUInteger(rect.minX), NSUInteger(rect.minY), NSUInteger(rect.width()), NSUInteger(rect.height()) }];
+
+        for (const VertexBufferBinding& vb : state.vertexBuffers)
+        {
+            auto* buffer = static_cast<Buffer*>(vb.buffer);
+            if (traceMetalRuntime() && !buffer)
+                m_Context.warning("[metal3-trace] null vertex buffer at slot " + std::to_string(vb.slot));
+            [encoder setVertexBuffer:buffer ? buffer->buffer : nil offset:NSUInteger(vb.offset) atIndex:vb.slot];
+            [encoder setVertexBuffer:buffer ? buffer->buffer : nil offset:NSUInteger(vb.offset) atIndex:c_MscVertexBufferBindPoint + vb.slot];
+        }
+        // path for finding and binding volatile command buffers
+        applyGraphicsBindings(encoder, state);
+
+        // for binding the rest of the textures, buffers, resources
+        // argument table is prepared (build or used from before)
+        id<MTLBuffer> vertexArgumentBuffer = getOrCreateArgumentTable(pipeline->vertexBindingPlan, state.bindings);
+        if (vertexArgumentBuffer)
+        {
+            m_ReferencedNativeBuffers.push_back(vertexArgumentBuffer);
+            [encoder setVertexBuffer:vertexArgumentBuffer offset:0 atIndex:kIRArgumentBufferBindPoint];
+            [encoder useResource:vertexArgumentBuffer usage:MTLResourceUsageRead];
+            useArgumentTableResources(encoder, state.bindings, pipeline->vertexBindingPlan, MTLRenderStageVertex);
+        }
+
+        if (pipeline->desc.PS)
+        {
+            id<MTLBuffer> fragmentArgumentBuffer = getOrCreateArgumentTable(pipeline->fragmentBindingPlan, state.bindings);
+            if (fragmentArgumentBuffer)
+            {
+                m_ReferencedNativeBuffers.push_back(fragmentArgumentBuffer);
+                [encoder setFragmentBuffer:fragmentArgumentBuffer offset:0 atIndex:kIRArgumentBufferBindPoint];
+                [encoder useResource:fragmentArgumentBuffer usage:MTLResourceUsageRead];
+                useArgumentTableResources(encoder, state.bindings, pipeline->fragmentBindingPlan, MTLRenderStageFragment);
+            }
+        }
+    }
+
+    bool CommandList::bindVolatileConstantBuffer(id<MTLRenderCommandEncoder> encoder, const BindingSetItem& item)
+    {
+        if (item.type != ResourceType::VolatileConstantBuffer)
+            return false;
+
+        auto* buffer = static_cast<Buffer*>(item.resourceHandle);
+        auto allocationIt = buffer ? m_VolatileBufferAllocations.find(buffer) : m_VolatileBufferAllocations.end();
+        if (!buffer || allocationIt == m_VolatileBufferAllocations.end() || !allocationIt->second.buffer)
+        {
+            if (traceMetalRuntime())
+                m_Context.warning("[metal3-trace] volatile constant buffer not written before graphics bind: slot=" +
+                    std::to_string(item.slot) + " name='" + (buffer ? buffer->desc.debugName : std::string("<null>")) + "'");
+            return false;
+        }
+
+        const BufferRange range = item.range.resolve(buffer->desc);
+        const UploadAllocation& allocation = allocationIt->second;
+        const NSUInteger offset = allocation.offset + NSUInteger(range.byteOffset);
+        [encoder setVertexBuffer:allocation.buffer offset:offset atIndex:item.slot];
+        [encoder setFragmentBuffer:allocation.buffer offset:offset atIndex:item.slot];
+        [encoder useResource:allocation.buffer usage:MTLResourceUsageRead stages:MTLRenderStageVertex | MTLRenderStageFragment];
+        return true;
+    }
+
+    bool CommandList::bindVolatileConstantBuffer(id<MTLComputeCommandEncoder> encoder, const BindingSetItem& item)
+    {
+        if (item.type != ResourceType::VolatileConstantBuffer)
+            return false;
+
+        auto* buffer = static_cast<Buffer*>(item.resourceHandle);
+        auto allocationIt = buffer ? m_VolatileBufferAllocations.find(buffer) : m_VolatileBufferAllocations.end();
+        if (!buffer || allocationIt == m_VolatileBufferAllocations.end() || !allocationIt->second.buffer)
+        {
+            if (traceMetalRuntime())
+                m_Context.warning("[metal3-trace] volatile constant buffer not written before compute bind: slot=" +
+                    std::to_string(item.slot) + " name='" + (buffer ? buffer->desc.debugName : std::string("<null>")) + "'");
+            return false;
+        }
+
+        const BufferRange range = item.range.resolve(buffer->desc);
+        const UploadAllocation& allocation = allocationIt->second;
+        const NSUInteger offset = allocation.offset + NSUInteger(range.byteOffset);
+        [encoder setBuffer:allocation.buffer offset:offset atIndex:item.slot];
+        [encoder useResource:allocation.buffer usage:MTLResourceUsageRead];
+        return true;
+    }
+    /* 
+    // Builds the Metal Shader Converter descriptor table for one shader stage.
+    // The pipeline's reflected binding plan tells us which argument-table index
+    // each HLSL resource occupies, and layoutIndex selects the matching NVRHI
+    // binding set from the current graphics/compute state. Each matched
+    // MetalBindingResource is encoded into an IRDescriptorTableEntry. The table
+    // is cached for the command list when the same plan and binding sets are
+    // reused by multiple draws/dispatches.
+    */
+    id<MTLBuffer> CommandList::getOrCreateArgumentTable(const MetalStageBindingPlan& plan, const BindingSetVector& bindingSets)
+    {
+        if (!plan.valid || plan.resourceCount == 0)
+        {
+            if (!plan.valid && traceMetalRuntime())
+            {
+                static int invalidPlanLogCount = 0;
+                if (invalidPlanLogCount++ < 32)
+                    m_Context.warning("[metal3-trace] missing reflected binding plan for " +
+                        std::string(utils::ShaderStageToString(plan.stage)) + "; regular shader resources are not directly bound");
+            }
+            return nil; 
+        }
+
+        MetalArgumentTableCacheKey key = makeArgumentTableCacheKey(plan, bindingSets);
+        for (const MetalArgumentTableCacheEntry& entry : m_ArgumentTableCache)
+        {
+            if (entry.key == key)
+                return entry.argumentBuffer;
+        }
+
+        const NSUInteger bufferSize = sizeof(IRDescriptorTableEntry) * plan.resourceCount;
+        id<MTLBuffer> argumentBuffer = [m_Context.device newBufferWithLength:bufferSize options:MTLResourceStorageModeShared];
+        if (!argumentBuffer)
+            return nil;
+
+        auto* entries = static_cast<IRDescriptorTableEntry*>([argumentBuffer contents]);
+        std::memset(entries, 0, bufferSize);
+
+        for (const MetalBindingPlanEntry& planEntry : plan.entries)
+        {
+            if (planEntry.argumentIndex >= plan.resourceCount)
+                continue;
+
+            if (usesDirectVolatileConstantBufferBinding(planEntry))
+                continue;
+
+            if (!planEntry.layoutMatched)
+            {
+                if (traceMetalRuntime())
+                {
+                    static int unmatchedPlanLogCount = 0;
+                    if (unmatchedPlanLogCount++ < 64)
+                        m_Context.warning("[metal3-trace] reflected " +
+                            std::string(utils::ShaderStageToString(plan.stage)) +
+                            " binding has no NVRHI layout match: arg=" + std::to_string(planEntry.argumentIndex) +
+                            " slot=" + std::to_string(planEntry.slot) +
+                            " space=" + std::to_string(planEntry.space));
+                }
+                continue;
+            }
+
+            const MetalBindingResource* resource = findArgumentTableResource(bindingSets, planEntry);
+            if (resource)
+                encodeArgumentTableEntry(&entries[planEntry.argumentIndex], *resource);
+            else if (traceMetalRuntime())
+            {
+                static int missingResourceLogCount = 0;
+                if (missingResourceLogCount++ < 64)
+                    m_Context.warning("[metal3-trace] no binding-set resource for reflected " +
+                        std::string(utils::ShaderStageToString(plan.stage)) +
+                        " binding: arg=" + std::to_string(planEntry.argumentIndex) +
+                        " slot=" + std::to_string(planEntry.slot) +
+                        " space=" + std::to_string(planEntry.space));
+            }
+        }
+
+        MetalArgumentTableCacheEntry entry;
+        entry.key = std::move(key);
+        entry.argumentBuffer = argumentBuffer;
+        m_ArgumentTableCache.push_back(std::move(entry));
+        return argumentBuffer;
+    }
+
+    // this path basically exclusively exists for binding volatile contant buffers
+    // regular resources go through the argument table path
+    void CommandList::applyGraphicsBindings(id<MTLRenderCommandEncoder> encoder, const GraphicsState& state)
+    {
+        for (IBindingSet* bindingSet : state.bindings)
+        {
+            auto* set = static_cast<BindingSet*>(bindingSet);
+            if (!set) continue;
+            referenceBindingSet(set);
+            for (const BindingSetItem& item : set->desc.bindings)
+            {
+                if (traceMetalRuntime() && !item.resourceHandle)
+                    m_Context.warning("[metal3-trace] graphics binding has null resource: type=" +
+                        std::string(resourceTypeName(item.type)) + " slot=" + std::to_string(item.slot));
+                bindVolatileConstantBuffer(encoder, item);
+            }
+        }
+    }
+
+    void CommandList::referenceBindingSet(BindingSet* bindingSet)
+    {
+        if (bindingSet)
+            m_ReferencedBindingSets.push_back(bindingSet);
+    }
+
 }
