@@ -16,6 +16,220 @@ namespace nvrhi::metal3
     static constexpr uint32_t c_MscVertexBufferBindPoint = 6;
     static constexpr uint32_t c_IrDrawArgumentsBindPoint = 4;
 
+    struct IcbIndexedIndirectParams
+    {
+        uint32_t maxDrawCount = 0;
+        uint32_t paramOffsetBytes = 0;
+        uint32_t countOffsetBytes = 0;
+        uint32_t indexType = 0;
+        uint32_t indexBufferOffset = 0;
+        uint32_t primitiveType = 0;
+        uint32_t drawArgumentsBindPoint = c_IrDrawArgumentsBindPoint;
+        uint32_t pad = 0;
+    };
+
+    /*
+    // helper used by drawIndexedIndirectCount. Metal cannot
+    // execute a counted indexed-indirect draw directly, so a compute shader
+    // converts the NVRHI args/count buffers into an MTLIndirectCommandBuffer.
+    // The pipeline runs that compute shader; icbEncoder encodes the ICB object
+    // into the helper shader's argument buffer.
+    */
+    struct IndexedIndirectIcbFillState
+    {
+        id<MTLComputePipelineState> pipeline = nil;
+        id<MTLArgumentEncoder> icbEncoder = nil;
+    };
+
+    // Compile and cache the ICB-fill compute pipeline once. The returned state
+    // stays empty if compilation fails, and callers simply skip counted indirect
+    // draws rather than trying to fall back to a CPU readback of the count.
+    static const IndexedIndirectIcbFillState& getIndexedIndirectIcbFillState(const MTL3Context& context)
+    {
+        static std::mutex mutex;
+        static IndexedIndirectIcbFillState state;
+        static bool attempted = false;
+
+        std::lock_guard<std::mutex> lock(mutex);
+        if (attempted)
+            return state;
+        attempted = true;
+
+        static constexpr const char* source = R"(
+            #include <metal_stdlib>
+            using namespace metal;
+
+            struct DrawIndexedIndirectArguments
+            {
+                uint indexCount;
+                uint instanceCount;
+                uint startIndexLocation;
+                int baseVertexLocation;
+                uint startInstanceLocation;
+            };
+
+            struct IcbIndexedIndirectParams
+            {
+                uint maxDrawCount;
+                uint paramOffsetBytes;
+                uint countOffsetBytes;
+                uint indexType;
+                uint indexBufferOffset;
+                uint primitiveType;
+                uint drawArgumentsBindPoint;
+                uint pad;
+            };
+
+            struct IcbArgumentBuffer
+            {
+                command_buffer icb [[id(0)]];
+            };
+
+            static primitive_type to_primitive_type(uint value)
+            {
+                switch (value)
+                {
+                case 0: return primitive_type::point;
+                case 1: return primitive_type::line;
+                case 2: return primitive_type::line_strip;
+                case 4: return primitive_type::triangle_strip;
+                default: return primitive_type::triangle;
+                }
+            }
+
+            // buffers encoded into compute encoder at 0...5 pos
+            // indirectParams -> indirect paramaters buffer (DrawArguments struct in nvrhi.h)
+            // rawCount -> indirect draw Count
+            // executionRange -> execute ICB commands from index 'n' for count 'm'
+            // indexBuffer - same index buffer, that is cached from setGraphicsState fn for the drawIndexedIndirectCount cmd 
+            // icbArgumentBuffer -> the MTLIndirectCommandBuffer is passed to the compute shader, to write a draw_indexed_primitives
+            // --- into render_command. this is processed in the end, with :
+            // --- [renderEncoder executeCommandsInBuffer:icb indirectBuffer:executionRange indirectBufferOffset:0];
+            // --- this, as the name implies, executes the commands in the ICB.
+
+            // all in all this, compute shader basically writes the drawIndexed commands into an indirect command buffer,
+            // (as UAV in d3d12 terms), and then the render encoder, executes the buffer commands
+            kernel void nvrhi_metal3_fill_indexed_indirect_icb(
+                device const uchar* indirectParams [[buffer(0)]],
+                device const uchar* rawCount [[buffer(1)]],
+                device uint2* executionRange [[buffer(2)]],
+                constant IcbArgumentBuffer& icbArgumentBuffer [[buffer(3)]],
+                device const uchar* indexBuffer [[buffer(4)]],
+                constant IcbIndexedIndirectParams& params [[buffer(5)]],
+                    uint tid [[thread_position_in_grid]])
+            {
+                device const uint* countPtr = reinterpret_cast<device const uint*>(rawCount + params.countOffsetBytes);
+                const uint gpuCount = min(*countPtr, params.maxDrawCount);
+
+                // Metal executes an ICB over an explicit range. write that range from
+                // the GPU count buffer so the render pass never needs a CPU readback.
+                if (tid == 0)
+                    executionRange[0] = uint2(0, gpuCount);
+
+                if (tid >= gpuCount)
+                    return;
+
+                device const DrawIndexedIndirectArguments* args =
+                    reinterpret_cast<device const DrawIndexedIndirectArguments*>(indirectParams + params.paramOffsetBytes);
+                const DrawIndexedIndirectArguments a = args[tid];
+
+                if (a.indexCount == 0 || a.instanceCount == 0)
+                    return;
+
+                // One compute thread writes one render command into the same slot as
+                // its source indirect argument.
+                render_command command(icbArgumentBuffer.icb, tid);
+
+                // Metal Shader Converter reads D3D draw parameters from this runtime
+                // bind point. Point every ICB command at its own source indirect args.
+                device const uchar* drawArgs =
+                    indirectParams + params.paramOffsetBytes + tid * uint(sizeof(DrawIndexedIndirectArguments));
+                command.set_vertex_buffer(drawArgs, params.drawArgumentsBindPoint);
+
+                if (params.indexType == 0)
+                {
+                    device const ushort* indices =
+                        reinterpret_cast<device const ushort*>(indexBuffer + params.indexBufferOffset) + a.startIndexLocation;
+                    command.draw_indexed_primitives(to_primitive_type(params.primitiveType),
+                        a.indexCount,
+                        indices,
+                        a.instanceCount,
+                        uint(a.baseVertexLocation),
+                        a.startInstanceLocation);
+                }
+                else
+                {
+                    device const uint* indices =
+                        reinterpret_cast<device const uint*>(indexBuffer + params.indexBufferOffset) + a.startIndexLocation;
+                    command.draw_indexed_primitives(to_primitive_type(params.primitiveType),
+                        a.indexCount,
+                        indices,
+                        a.instanceCount,
+                        uint(a.baseVertexLocation),
+                        a.startInstanceLocation);
+                }
+            }
+        )";
+
+        NSError* error = nil;
+        MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+        if (@available(macOS 13.0, *))
+            options.languageVersion = MTLLanguageVersion3_0;
+
+        id<MTLLibrary> library = [context.device newLibraryWithSource:[NSString stringWithUTF8String:source]
+                                                               options:options
+                                                                 error:&error];
+        if (!library)
+        {
+            std::string message = "[metal3] failed to compile indexed-indirect ICB helper";
+            if (error)
+                message += std::string(": ") + [[error localizedDescription] UTF8String];
+            context.error(message);
+            return state;
+        }
+
+        id<MTLFunction> function = [library newFunctionWithName:@"nvrhi_metal3_fill_indexed_indirect_icb"];
+        if (!function)
+        {
+            context.error("[metal3] indexed-indirect ICB helper function missing");
+            return state;
+        }
+
+        state.icbEncoder = [function newArgumentEncoderWithBufferIndex:3];
+        if (!state.icbEncoder)
+        {
+            context.error("[metal3] failed to create indexed-indirect ICB argument encoder");
+            return state;
+        }
+
+        if (@available(macOS 11.0, *))
+        {
+            MTLComputePipelineDescriptor* descriptor = [[MTLComputePipelineDescriptor alloc] init];
+            descriptor.computeFunction = function;
+            // Required because this compute pipeline writes render commands into
+            // an MTLIndirectCommandBuffer.
+            descriptor.supportIndirectCommandBuffers = YES;
+            state.pipeline = [context.device newComputePipelineStateWithDescriptor:descriptor
+                                                                           options:MTLPipelineOptionNone
+                                                                        reflection:nil
+                                                                             error:&error];
+        }
+        else
+        {
+            state.pipeline = [context.device newComputePipelineStateWithFunction:function error:&error];
+        }
+
+        if (!state.pipeline)
+        {
+            std::string message = "[metal3] failed to create indexed-indirect ICB helper pipeline";
+            if (error)
+                message += std::string(": ") + [[error localizedDescription] UTF8String];
+            context.error(message); 
+        }
+        
+        return state;
+    }
+
     static bool traceMetalRuntime()
     {
         static bool enabled = [] {
@@ -929,6 +1143,134 @@ namespace nvrhi::metal3
                 offsetBytes);
             offsetBytes += sizeof(DrawIndexedIndirectArguments);
         }
+    }
+
+    void CommandList::drawIndexedIndirectCount(uint32_t paramOffsetBytes, uint32_t countOffsetBytes, uint32_t maxDrawCount)
+    {
+        if (!m_CurrentGraphicsStateValid || maxDrawCount == 0)
+            return;
+
+        auto* pipeline = static_cast<GraphicsPipeline*>(m_CurrentGraphicsState.pipeline);
+        auto* indexBuffer = static_cast<Buffer*>(m_CurrentGraphicsState.indexBuffer.buffer);
+        auto* indirectParams = static_cast<Buffer*>(m_CurrentGraphicsState.indirectParams);
+        auto* indirectCount = static_cast<Buffer*>(m_CurrentGraphicsState.indirectCountBuffer);
+        if (!pipeline || !indexBuffer || !indexBuffer->buffer || !indirectParams || !indirectParams->buffer ||
+            !indirectCount || !indirectCount->buffer)
+        {
+            if (traceMetalRuntime())
+                m_Context.warning("[metal3-trace] drawIndexedIndirectCount skipped: missing pipeline/index/args/count buffer");
+            return;
+        }
+
+        const IndexedIndirectIcbFillState& fillState = getIndexedIndirectIcbFillState(m_Context);
+        if (!fillState.pipeline || !fillState.icbEncoder)
+        {
+            m_Context.warning("[metal3] counted indexed indirect draw skipped because the ICB helper pipeline is unavailable");
+            return;
+        }
+
+        id<MTLRenderCommandEncoder> renderEncoder = getOrCreateRenderEncoder();
+        if (!renderEncoder)
+            return;
+        endEncoding();
+        // Metal supports indexed indirect draws, but not NVRHI's counted
+        // indexed indirect operation directly. Generate a render ICB on the GPU
+        // from the same args/count buffers and execute it with a GPU-written
+        // MTLIndirectCommandBufferExecutionRange.
+
+        MTLIndirectCommandBufferDescriptor* icbDesc = [[MTLIndirectCommandBufferDescriptor alloc] init];
+        icbDesc.commandTypes = MTLIndirectCommandTypeDrawIndexed;
+        // The helper compute pass only writes the per-draw indexed commands.
+        // Pipeline state, vertex buffers, and the MSC argument table are inherited
+        // from the render encoder that later executes the ICB, so the graphics
+        // state must be restored before executeCommandsInBuffer below.
+        icbDesc.inheritPipelineState = YES;
+        icbDesc.inheritBuffers = YES;
+        icbDesc.maxVertexBufferBindCount = std::max<NSUInteger>(c_IrDrawArgumentsBindPoint + 1, c_MscVertexBufferBindPoint + 1);
+        icbDesc.maxFragmentBufferBindCount = 0;
+
+        id<MTLIndirectCommandBuffer> icb =
+            [m_Context.device newIndirectCommandBufferWithDescriptor:icbDesc
+                                                     maxCommandCount:NSUInteger(maxDrawCount)
+                                                            options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> executionRange =
+            [m_Context.device newBufferWithLength:sizeof(MTLIndirectCommandBufferExecutionRange)
+                                          options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> paramsBuffer =
+            [m_Context.device newBufferWithLength:sizeof(IcbIndexedIndirectParams)
+                                          options:MTLResourceStorageModeShared];
+        id<MTLBuffer> icbArgumentBuffer =
+            [m_Context.device newBufferWithLength:fillState.icbEncoder.encodedLength
+                                          options:MTLResourceStorageModeShared];
+        if (!icb || !executionRange || !paramsBuffer || !icbArgumentBuffer)
+        {
+            m_Context.error("[metal3] failed to allocate counted indexed indirect ICB resources");
+            return;
+        }
+
+        // Metal compute shaders receive an indirect command buffer through an
+        // argument buffer. This encodes the ICB object into that argument buffer
+        // so nvrhi_metal3_fill_indexed_indirect_icb can write render commands.
+        [fillState.icbEncoder setArgumentBuffer:icbArgumentBuffer offset:0];
+        [fillState.icbEncoder setIndirectCommandBuffer:icb atIndex:0];
+
+        // Small CPU-written constant block consumed by the helper shader. It
+        // describes where to read draw args/counts, how to interpret the index
+        // buffer, and which MSC runtime vertex-buffer slot should receive each
+        // draw's original D3D-style indirect argument record.
+        auto* params = reinterpret_cast<IcbIndexedIndirectParams*>([paramsBuffer contents]);
+        params->maxDrawCount = maxDrawCount;
+        params->paramOffsetBytes = paramOffsetBytes;
+        params->countOffsetBytes = countOffsetBytes;
+        params->indexType = m_CurrentGraphicsState.indexBuffer.format == Format::R16_UINT ? 0u : 1u;
+        params->indexBufferOffset = uint32_t(m_CurrentGraphicsState.indexBuffer.offset);
+        params->primitiveType = uint32_t(pipeline->primitiveType);
+        params->drawArgumentsBindPoint = c_IrDrawArgumentsBindPoint;
+
+        m_ReferencedNativeResources.push_back(icb);
+        m_ReferencedNativeResources.push_back(executionRange);
+        m_ReferencedNativeBuffers.push_back(paramsBuffer);
+        m_ReferencedNativeBuffers.push_back(icbArgumentBuffer);
+
+        // ICB memory is reused by Metal internally; reset the command range before
+        // the compute pass selectively fills commands 0..min(gpuCount,maxDrawCount).
+        id<MTLBlitCommandEncoder> blit = [trackedCmdBuffer blitCommandEncoder];
+        [blit resetCommandsInBuffer:icb withRange:NSMakeRange(0, maxDrawCount)];
+        [blit endEncoding];
+
+        // Fill the ICB on the GPU. Thread 0 writes the execution range from the
+        // GPU count buffer, and each thread below that count writes one indexed
+        // draw command from indirectParams[tid].
+        id<MTLComputeCommandEncoder> compute = [trackedCmdBuffer computeCommandEncoder];
+        [compute setComputePipelineState:fillState.pipeline];
+        [compute setBuffer:indirectParams->buffer offset:0 atIndex:0];
+        [compute setBuffer:indirectCount->buffer offset:0 atIndex:1];
+        [compute setBuffer:executionRange offset:0 atIndex:2];
+        [compute setBuffer:icbArgumentBuffer offset:0 atIndex:3];
+        [compute setBuffer:indexBuffer->buffer offset:0 atIndex:4];
+        [compute setBuffer:paramsBuffer offset:0 atIndex:5];
+        [compute useResource:indirectParams->buffer usage:MTLResourceUsageRead];
+        [compute useResource:indirectCount->buffer usage:MTLResourceUsageRead];
+        [compute useResource:indexBuffer->buffer usage:MTLResourceUsageRead];
+        [compute useResource:executionRange usage:MTLResourceUsageWrite];
+        [compute useResource:icb usage:MTLResourceUsageWrite];
+        const NSUInteger threads = std::max<NSUInteger>(1, fillState.pipeline.threadExecutionWidth);
+        const NSUInteger groups = (NSUInteger(maxDrawCount) + threads - 1) / threads;
+        [compute dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        [compute endEncoding];
+
+        renderEncoder = getOrCreateRenderEncoder();
+        // The blit/compute work above closes the original render encoder. Since
+        // this ICB inherits pipeline and buffer state from the executing render
+        // encoder, restore the full graphics state before executeCommandsInBuffer.
+        applyGraphicsStateToEncoder(renderEncoder, m_CurrentGraphicsState);
+        [renderEncoder useResource:icb usage:MTLResourceUsageRead];
+        [renderEncoder useResource:executionRange usage:MTLResourceUsageRead];
+        [renderEncoder useResource:indirectParams->buffer usage:MTLResourceUsageRead];
+        [renderEncoder useResource:indexBuffer->buffer usage:MTLResourceUsageRead];
+        // Execute only the GPU-written range. This is what turns NVRHI's count
+        // buffer into Metal's MTLIndirectCommandBufferExecutionRange.
+        [renderEncoder executeCommandsInBuffer:icb indirectBuffer:executionRange indirectBufferOffset:0];
     }
 
     void CommandList::setComputeState(const ComputeState& state)
