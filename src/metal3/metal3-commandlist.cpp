@@ -843,6 +843,94 @@ namespace nvrhi::metal3
         IRRuntimeDrawIndexedPrimitives(encoder, pipeline->primitiveType, args.vertexCount, convertIndexFormat(m_CurrentGraphicsState.indexBuffer.format), indexBuffer->buffer, m_CurrentGraphicsState.indexBuffer.offset + args.startIndexLocation * (m_CurrentGraphicsState.indexBuffer.format == Format::R32_UINT ? 4 : 2), args.instanceCount, args.startVertexLocation, args.startInstanceLocation);
     }
 
+    void CommandList::drawIndirect(uint32_t offsetBytes, uint32_t drawCount)
+    {
+        if (!m_CurrentGraphicsStateValid)
+        {
+            if (traceMetalRuntime())
+                m_Context.warning("[metal3-trace] drawIndirect skipped: graphics state invalid");
+            return;
+        }
+        id<MTLRenderCommandEncoder> encoder = getOrCreateRenderEncoder();
+        auto* pipeline = static_cast<GraphicsPipeline*>(m_CurrentGraphicsState.pipeline);
+        auto* indirectParams = static_cast<Buffer*>(m_CurrentGraphicsState.indirectParams);
+        if (!encoder || !pipeline || !indirectParams || !indirectParams->buffer)
+        {
+            if (traceMetalRuntime())
+                m_Context.warning("[metal3-trace] drawIndirect skipped: encoder=" +
+                    std::string(encoder ? "yes" : "no") + " pipeline=" + (pipeline ? "yes" : "no") +
+                    " indirect='" + (indirectParams ? indirectParams->desc.debugName : std::string("<null>")) + "'");
+            return;
+        }
+
+        // uncomment for debugging
+        // static int drawIndirectLogCount = 0;
+        // if (traceMetalRuntime() && drawIndirectLogCount++ < 64)
+        //     m_Context.info("[metal3-trace] drawIndirect count=" + std::to_string(drawCount) +
+        //         " offset=" + std::to_string(offsetBytes) + " args='" + indirectParams->desc.debugName + "'");
+
+        for (uint32_t drawIndex = 0; drawIndex < drawCount; ++drawIndex)
+        {
+            // Metal Shader Converter vertex shaders read draw parameters from
+            // the IR runtime bind points. Use the runtime wrapper for indirect
+            // draws too; raw Metal draws do not populate those translated
+            // D3D-style draw parameter bindings.
+            IRRuntimeDrawPrimitives(encoder, pipeline->primitiveType, indirectParams->buffer, offsetBytes);
+            offsetBytes += sizeof(DrawIndirectArguments);
+        }
+    }
+    
+    void CommandList::drawIndexedIndirect(uint32_t offsetBytes, uint32_t drawCount)
+    {
+        if (!m_CurrentGraphicsStateValid)
+        {
+            if (traceMetalRuntime())
+                m_Context.warning("[metal3-trace] drawIndexedIndirect skipped: graphics state invalid");
+            return;
+        }
+        id<MTLRenderCommandEncoder> encoder = getOrCreateRenderEncoder();
+        auto* pipeline = static_cast<GraphicsPipeline*>(m_CurrentGraphicsState.pipeline);
+        auto* indexBuffer = static_cast<Buffer*>(m_CurrentGraphicsState.indexBuffer.buffer);
+        auto* indirectParams = static_cast<Buffer*>(m_CurrentGraphicsState.indirectParams);
+        if (!encoder || !pipeline || !indexBuffer || !indexBuffer->buffer || !indirectParams || !indirectParams->buffer)
+        {
+            if (traceMetalRuntime())
+                m_Context.warning("[metal3-trace] drawIndexedIndirect skipped: encoder=" +
+                    std::string(encoder ? "yes" : "no") + " pipeline=" + (pipeline ? "yes" : "no") +
+                    " index='" + (indexBuffer ? indexBuffer->desc.debugName : std::string("<null>")) +
+                    "' indirect='" + (indirectParams ? indirectParams->desc.debugName : std::string("<null>")) + "'");
+            return;
+        }
+
+        const uint64_t requiredBytes = uint64_t(offsetBytes) + uint64_t(drawCount) * sizeof(DrawIndexedIndirectArguments);
+        if (requiredBytes > indirectParams->desc.byteSize)
+            m_Context.warning("[metal3-trace] drawIndexedIndirect range exceeds args buffer: required=" +
+                std::to_string(requiredBytes) + " bufferSize=" + std::to_string(indirectParams->desc.byteSize) +
+                " args='" + indirectParams->desc.debugName + "'");
+
+        static int drawIndexedIndirectLogCount = 0;
+        if (traceMetalRuntime() && drawIndexedIndirectLogCount++ < 96)
+            m_Context.info("[metal3-trace] drawIndexedIndirect count=" + std::to_string(drawCount) +
+                " offset=" + std::to_string(offsetBytes) +
+                " index='" + indexBuffer->desc.debugName +
+                "' args='" + indirectParams->desc.debugName + "'");
+
+        for (uint32_t drawIndex = 0; drawIndex < drawCount; ++drawIndex)
+        {
+            // Keep converted vertex shaders in the same draw-parameter path as
+            // direct indexed draws. This is especially important for indirect
+            // base-instance/start-instance data produced by GPU culling.
+            IRRuntimeDrawIndexedPrimitives(encoder,
+                pipeline->primitiveType,
+                convertIndexFormat(m_CurrentGraphicsState.indexBuffer.format),
+                indexBuffer->buffer,
+                m_CurrentGraphicsState.indexBuffer.offset,
+                indirectParams->buffer,
+                offsetBytes);
+            offsetBytes += sizeof(DrawIndexedIndirectArguments);
+        }
+    }
+
     void CommandList::setComputeState(const ComputeState& state)
     {
         m_CurrentComputeState = state;

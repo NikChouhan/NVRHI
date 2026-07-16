@@ -385,8 +385,11 @@ namespace nvrhi::metal3
         void draw(const DrawArguments& args) override;
         void drawIndexed(const DrawArguments& args) override;
 
+        // supplying with draw count, just loops over the draw indices and issue
+        // the draw calls one at a time, cpu side
         void drawIndirect(uint32_t offsetBytes, uint32_t drawCount) override;
         void drawIndexedIndirect(uint32_t offsetBytes, uint32_t drawCount) override;
+
         void drawIndexedIndirectCount(uint32_t paramOffsetBytes, uint32_t countOffsetBytes, uint32_t maxDrawCount) override;
 
         void setComputeState(const ComputeState& state) override;
