@@ -10,9 +10,14 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#if defined(NVRHI_METAL3_WITH_TRACY) && defined(TRACY_ENABLE)
+#include <tracy/TracyMetal.hmm>
+#endif
 
 namespace nvrhi::metal3 
 {
@@ -444,9 +449,20 @@ namespace nvrhi::metal3
 
         // Metal3 specific methods
         id<MTLCommandBuffer> getNativeCommandBuffer() override;
+        void setTracyGpuScope(const char* name, const char* file, const char* function, uint32_t line, void* context) override;
+        void clearTracyGpuScope() override;
     private:
+        struct TracyGpuScopeDesc
+        {
+            const char* name = nullptr;
+            const char* file = nullptr;
+            const char* function = nullptr;
+            uint32_t line = 0;
+            void* context = nullptr;
+            bool active = false;
+        };
         const MTL3Context& m_Context;
-        
+
         IDevice* m_Device;
         
         // i can prolly have Queue struct and pointer to object here
@@ -483,6 +499,12 @@ namespace nvrhi::metal3
         size_t m_PushConstantSize = 0;
         std::unordered_map<Buffer*, UploadAllocation> m_VolatileBufferAllocations;
 
+        TracyGpuScopeDesc m_TracyGpuScope;
+#if defined(NVRHI_METAL3_WITH_TRACY) && defined(TRACY_ENABLE)
+        std::optional<tracy::MetalZoneScope> m_TracyEncoderScope;
+        std::vector<std::unique_ptr<tracy::SourceLocationData>> m_TracySourceLocations;
+#endif
+
         void endEncoding();
         id<MTLRenderCommandEncoder> getOrCreateRenderEncoder();
         id<MTLComputeCommandEncoder> getOrCreateComputeEncoder();
@@ -493,6 +515,11 @@ namespace nvrhi::metal3
         void applyGraphicsBindings(id<MTLRenderCommandEncoder> encoder, const GraphicsState& state);
         void applyComputeBindings(id<MTLComputeCommandEncoder> encoder, const ComputeState& state);
         void referenceBindingSet(BindingSet* bindingSet);
+#if defined(NVRHI_METAL3_WITH_TRACY) && defined(TRACY_ENABLE)
+        tracy::SourceLocationData* getOrCreateTracySourceLocation();
+        void beginTracyRenderEncoderZone(MTLRenderPassDescriptor* desc);
+        void beginTracyComputeEncoderZone(MTLComputePassDescriptor* desc);
+#endif
     };
 
     // metal3 device

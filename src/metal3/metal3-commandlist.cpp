@@ -601,6 +601,73 @@ namespace nvrhi::metal3
         return trackedCmdBuffer;
     }
 
+    void CommandList::setTracyGpuScope(const char* name, const char* file, const char* function, uint32_t line, void* context)
+    {
+        m_TracyGpuScope.name = name;
+        m_TracyGpuScope.file = file;
+        m_TracyGpuScope.function = function;
+        m_TracyGpuScope.line = line;
+        m_TracyGpuScope.context = context;
+        m_TracyGpuScope.active = name && file && function && context;
+    }
+
+    void CommandList::clearTracyGpuScope()
+    {
+        m_TracyGpuScope = TracyGpuScopeDesc{};
+    }
+
+#if defined(NVRHI_METAL3_WITH_TRACY) && defined(TRACY_ENABLE)
+    tracy::SourceLocationData* CommandList::getOrCreateTracySourceLocation()
+    {
+        if (!m_TracyGpuScope.active)
+            return nullptr;
+
+        for (const auto& sourceLocation : m_TracySourceLocations)
+        {
+            if (sourceLocation->line == m_TracyGpuScope.line &&
+                std::strcmp(sourceLocation->name ? sourceLocation->name : "", m_TracyGpuScope.name ? m_TracyGpuScope.name : "") == 0 &&
+                std::strcmp(sourceLocation->file ? sourceLocation->file : "", m_TracyGpuScope.file ? m_TracyGpuScope.file : "") == 0 &&
+                std::strcmp(sourceLocation->function ? sourceLocation->function : "", m_TracyGpuScope.function ? m_TracyGpuScope.function : "") == 0)
+                return sourceLocation.get();
+        }
+
+        auto sourceLocation = std::make_unique<tracy::SourceLocationData>();
+        sourceLocation->name = m_TracyGpuScope.name;
+        sourceLocation->function = m_TracyGpuScope.function;
+        sourceLocation->file = m_TracyGpuScope.file;
+        sourceLocation->line = m_TracyGpuScope.line;
+        sourceLocation->color = 0;
+
+        tracy::SourceLocationData* ptr = sourceLocation.get();
+        m_TracySourceLocations.push_back(std::move(sourceLocation));
+        return ptr;
+    }
+
+    void CommandList::beginTracyRenderEncoderZone(MTLRenderPassDescriptor* desc)
+    {
+        if (!desc || !m_TracyGpuScope.active || !m_TracyGpuScope.context)
+            return;
+
+        tracy::SourceLocationData* sourceLocation = getOrCreateTracySourceLocation();
+        if (!sourceLocation)
+            return;
+
+        m_TracyEncoderScope.emplace(static_cast<TracyMetalCtx*>(m_TracyGpuScope.context), desc, sourceLocation, true);
+    }
+
+    void CommandList::beginTracyComputeEncoderZone(MTLComputePassDescriptor* desc)
+    {
+        if (!desc || !m_TracyGpuScope.active || !m_TracyGpuScope.context)
+            return;
+
+        tracy::SourceLocationData* sourceLocation = getOrCreateTracySourceLocation();
+        if (!sourceLocation)
+            return;
+
+        m_TracyEncoderScope.emplace(static_cast<TracyMetalCtx*>(m_TracyGpuScope.context), desc, sourceLocation, true);
+    }
+#endif
+
     void CommandList::endEncoding()
     {
         if (m_RenderEncoder)
@@ -613,6 +680,9 @@ namespace nvrhi::metal3
             [m_ComputeEncoder endEncoding];
             m_ComputeEncoder = nil;
         }
+#if defined(NVRHI_METAL3_WITH_TRACY) && defined(TRACY_ENABLE)
+        m_TracyEncoderScope.reset();
+#endif
     }
 
     // crates a new command buffer, invalidates compute and graphics state, and the encoders
@@ -1038,6 +1108,9 @@ namespace nvrhi::metal3
             rp.depthAttachment.loadAction = MTLLoadActionLoad;
             rp.depthAttachment.storeAction = MTLStoreActionStore;
         }
+#if defined(NVRHI_METAL3_WITH_TRACY) && defined(TRACY_ENABLE)
+        beginTracyRenderEncoderZone(rp);
+#endif
 
         m_RenderEncoder = [trackedCmdBuffer renderCommandEncoderWithDescriptor:rp];
         if (!m_RenderEncoder)
@@ -1049,7 +1122,11 @@ namespace nvrhi::metal3
         if (m_ComputeEncoder)
             return m_ComputeEncoder;
         endEncoding();
-        m_ComputeEncoder = [trackedCmdBuffer computeCommandEncoder];
+        MTLComputePassDescriptor* cp = [MTLComputePassDescriptor computePassDescriptor];
+#if defined(NVRHI_METAL3_WITH_TRACY) && defined(TRACY_ENABLE)
+        beginTracyComputeEncoderZone(cp);
+#endif
+        m_ComputeEncoder = [trackedCmdBuffer computeCommandEncoderWithDescriptor:cp];
         if (!m_ComputeEncoder)
             m_Context.error("[metal3-trace] failed to create compute command encoder");
         return m_ComputeEncoder;
