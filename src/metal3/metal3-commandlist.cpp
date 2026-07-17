@@ -596,6 +596,25 @@ namespace nvrhi::metal3
         }
     }
 
+    id<MTLCommandBuffer> CommandList::getNativeCommandBuffer()
+    {
+        return trackedCmdBuffer;
+    }
+
+    void CommandList::endEncoding()
+    {
+        if (m_RenderEncoder)
+        {
+            [m_RenderEncoder endEncoding];
+            m_RenderEncoder = nil;
+        }
+        if (m_ComputeEncoder)
+        {
+            [m_ComputeEncoder endEncoding];
+            m_ComputeEncoder = nil;
+        }
+    }
+
     // crates a new command buffer, invalidates compute and graphics state, and the encoders
     void CommandList::open()
     {
@@ -1024,6 +1043,16 @@ namespace nvrhi::metal3
         if (!m_RenderEncoder)
             m_Context.error("[metal3-trace] failed to create render command encoder");
         return m_RenderEncoder;
+    }
+    id<MTLComputeCommandEncoder> CommandList::getOrCreateComputeEncoder()
+    {
+        if (m_ComputeEncoder)
+            return m_ComputeEncoder;
+        endEncoding();
+        m_ComputeEncoder = [trackedCmdBuffer computeCommandEncoder];
+        if (!m_ComputeEncoder)
+            m_Context.error("[metal3-trace] failed to create compute command encoder");
+        return m_ComputeEncoder;
     }
     
     void CommandList::draw(const DrawArguments& args)
