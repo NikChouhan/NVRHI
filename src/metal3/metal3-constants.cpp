@@ -12,6 +12,8 @@ namespace nvrhi::metal3
         case TextureDimension::Texture2DArray: return sampleCount > 1 ? MTLTextureType2DMultisampleArray : MTLTextureType2DArray;
         case TextureDimension::TextureCube: return MTLTextureTypeCube;
         case TextureDimension::TextureCubeArray: return MTLTextureTypeCubeArray;
+        case TextureDimension::Texture2DMS: return MTLTextureType2DMultisample;
+        case TextureDimension::Texture2DMSArray: return MTLTextureType2DMultisampleArray;
         case TextureDimension::Texture3D: return MTLTextureType3D;
         default: return MTLTextureType2D;
         }
