@@ -338,8 +338,58 @@ namespace nvrhi::metal3
         dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
         std::atomic<bool> signaled{ true };
     };
-    // TODO: stub
+    // TODO: stubs
     class TimerQuery : public RefCounter<ITimerQuery> { public: bool resolved = true; float time = 0.f; };
+
+    class ShaderTable : public RefCounter<rt::IShaderTable>
+    {
+    public:
+        rt::ShaderTableDesc desc;
+        rt::IPipeline* pipeline = nullptr;
+        uint32_t numEntries = 0;
+        rt::ShaderTableDesc const& getDesc() const override { return desc; }
+        uint32_t getNumEntries() const override { return numEntries; }
+        rt::IPipeline* getPipeline() const override { return pipeline; }
+        void setRayGenerationShader(const char* exportName, IBindingSet* bindings = nullptr) override { (void)exportName; (void)bindings; numEntries = std::max(numEntries, 1u); }
+        int addMissShader(const char* exportName, IBindingSet* bindings = nullptr) override { (void)exportName; (void)bindings; return int(numEntries++); }
+        int addHitGroup(const char* exportName, IBindingSet* bindings = nullptr) override { (void)exportName; (void)bindings; return int(numEntries++); }
+        int addCallableShader(const char* exportName, IBindingSet* bindings = nullptr) override { (void)exportName; (void)bindings; return int(numEntries++); }
+        void clearMissShaders() override {}
+        void clearHitShaders() override {}
+        void clearCallableShaders() override {}
+    };
+
+    class RayTracingPipeline : public RefCounter<rt::IPipeline>
+    {
+    public:
+        rt::PipelineDesc desc;
+        const rt::PipelineDesc& getDesc() const override { return desc; }
+        rt::ShaderTableHandle createShaderTable(rt::ShaderTableDesc const& tableDesc = rt::ShaderTableDesc()) override
+        {
+            ShaderTable* table = new ShaderTable();
+            table->desc = tableDesc;
+            table->pipeline = this;
+            return rt::ShaderTableHandle::Create(table);
+        }
+    };
+
+    class DummyOpacityMicromap : public RefCounter<rt::IOpacityMicromap>
+    {
+    public:
+        rt::OpacityMicromapDesc desc;
+        const rt::OpacityMicromapDesc& getDesc() const override { return desc; }
+        bool isCompacted() const override { return false; }
+        uint64_t getDeviceAddress() const override { return 0; }
+    };
+
+    class DummyAccelStruct : public RefCounter<rt::IAccelStruct>
+    {
+    public:
+        rt::AccelStructDesc desc;
+        const rt::AccelStructDesc& getDesc() const override { return desc; }
+        bool isCompacted() const override { return false; }
+        uint64_t getDeviceAddress() const override { return 0; }
+    };
 
     // commandList impl
     class CommandList final : public RefCounter<nvrhi::metal3::ICommandList>
@@ -476,9 +526,13 @@ namespace nvrhi::metal3
         // Cache for user-provided state
         GraphicsState m_CurrentGraphicsState;
         ComputeState m_CurrentComputeState;
+        MeshletState m_CurrentMeshletState;
         rt::State m_CurrentRayTracingState;
         bool m_CurrentGraphicsStateValid = false;
         bool m_CurrentComputeStateValid = false;
+        bool m_CurrentMeshletStateValid = false;
+        bool m_CurrentRayTracingStateValid = false;
+
         bool m_BindingStatesDirty = false;
 
         // Cache for internal state

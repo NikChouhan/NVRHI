@@ -1617,5 +1617,36 @@ namespace nvrhi::metal3
         if (bindingSet)
             m_ReferencedBindingSets.push_back(bindingSet);
     }
-
+    
+    void CommandList::dispatchIndirect(uint32_t offsetBytes) { (void)offsetBytes; }
+    void CommandList::setMeshletState(const MeshletState& state) { m_CurrentMeshletState = state; m_CurrentMeshletStateValid = true; }
+    void CommandList::dispatchMesh(uint32_t groupsX, uint32_t groupsY, uint32_t groupsZ) { (void)groupsX; (void)groupsY; (void)groupsZ; }
+    void CommandList::setRayTracingState(const rt::State& state) { m_CurrentRayTracingState = state; m_CurrentRayTracingStateValid = true; }
+    void CommandList::dispatchRays(const rt::DispatchRaysArguments& args) { (void)args; }
+    void CommandList::buildOpacityMicromap(rt::IOpacityMicromap* omm, const rt::OpacityMicromapDesc& desc) { (void)omm; (void)desc; }
+    void CommandList::buildBottomLevelAccelStruct(rt::IAccelStruct* as, const rt::GeometryDesc* pGeometries, size_t numGeometries, rt::AccelStructBuildFlags buildFlags) { (void)as; (void)pGeometries; (void)numGeometries; (void)buildFlags; }
+    void CommandList::compactBottomLevelAccelStructs() {}
+    void CommandList::buildTopLevelAccelStruct(rt::IAccelStruct* as, const rt::InstanceDesc* pInstances, size_t numInstances, rt::AccelStructBuildFlags buildFlags) { (void)as; (void)pInstances; (void)numInstances; (void)buildFlags; }
+    void CommandList::buildTopLevelAccelStructFromBuffer(rt::IAccelStruct* as, nvrhi::IBuffer* instanceBuffer, uint64_t instanceBufferOffset, size_t numInstances, rt::AccelStructBuildFlags buildFlags) { (void)as; (void)instanceBuffer; (void)instanceBufferOffset; (void)numInstances; (void)buildFlags; }
+    void CommandList::executeMultiIndirectClusterOperation(const rt::cluster::OperationDesc& desc) { (void)desc; }
+    void CommandList::convertCoopVecMatrices(coopvec::ConvertMatrixLayoutDesc const* convertDescs, size_t numDescs) { (void)convertDescs; (void)numDescs; }
+    void CommandList::beginTimerQuery(ITimerQuery* query) { (void)query; }
+    void CommandList::endTimerQuery(ITimerQuery* query) { (void)query; }
+    void CommandList::setEnableAutomaticBarriers(bool enable) { (void)enable; }
+    void CommandList::setResourceStatesForBindingSet(IBindingSet* bindingSet) { (void)bindingSet; }
+    void CommandList::setEnableUavBarriersForTexture(ITexture* texture, bool enableBarriers) { (void)texture; (void)enableBarriers; }
+    void CommandList::setEnableUavBarriersForBuffer(IBuffer* buffer, bool enableBarriers) { (void)buffer; (void)enableBarriers; }
+    void CommandList::beginTrackingTextureState(ITexture* texture, TextureSubresourceSet subresources, ResourceStates stateBits) { (void)texture; (void)subresources; (void)stateBits; }
+    void CommandList::beginTrackingBufferState(IBuffer* buffer, ResourceStates stateBits) { (void)buffer; (void)stateBits; }
+    void CommandList::setTextureState(ITexture* texture, TextureSubresourceSet subresources, ResourceStates stateBits) { (void)texture; (void)subresources; (void)stateBits; }
+    void CommandList::setBufferState(IBuffer* buffer, ResourceStates stateBits) { (void)buffer; (void)stateBits; }
+    void CommandList::setAccelStructState(rt::IAccelStruct* as, ResourceStates stateBits) { (void)as; (void)stateBits; }
+    void CommandList::setPermanentTextureState(ITexture* texture, ResourceStates stateBits) { (void)texture; (void)stateBits; }
+    void CommandList::setPermanentBufferState(IBuffer* buffer, ResourceStates stateBits) { (void)buffer; (void)stateBits; }
+    void CommandList::commitBarriers() {}
+    ResourceStates CommandList::getTextureSubresourceState(ITexture* texture, ArraySlice arraySlice, MipLevel mipLevel) { (void)texture; (void)arraySlice; (void)mipLevel; return ResourceStates::Unknown; }
+    ResourceStates CommandList::getBufferState(IBuffer* buffer) { (void)buffer; return ResourceStates::Unknown; }
+    void CommandList::clearSamplerFeedbackTexture(ISamplerFeedbackTexture* texture) { (void)texture; }
+    void CommandList::decodeSamplerFeedbackTexture(IBuffer* buffer, ISamplerFeedbackTexture* texture, Format format) { (void)buffer; (void)texture; (void)format; }
+    void CommandList::setSamplerFeedbackTextureState(ISamplerFeedbackTexture* texture, ResourceStates stateBits) { (void)texture; (void)stateBits; }
 }
