@@ -1413,6 +1413,26 @@ namespace nvrhi::metal3
         }
     }
 
+    void CommandList::dispatch(uint32_t groupsX, uint32_t groupsY, uint32_t groupsZ)
+    {
+        if (!m_CurrentComputeStateValid)
+        {
+            if (traceMetalRuntime())
+                m_Context.warning("[metal3-trace] dispatch skipped: compute state invalid");
+            return;
+        }
+        id<MTLComputeCommandEncoder> encoder = getOrCreateComputeEncoder();
+        auto* pipeline = static_cast<ComputePipeline*>(m_CurrentComputeState.pipeline);
+        if (!encoder || !pipeline)
+        {
+            if (traceMetalRuntime())
+                m_Context.warning("[metal3-trace] dispatch skipped: encoder/pipeline missing");
+            return;
+        }
+        MTLSize threadsPerGroup = pipeline->threadsPerGroup;
+        [encoder dispatchThreadgroups:MTLSizeMake(groupsX, groupsY, groupsZ) threadsPerThreadgroup:threadsPerGroup];
+    }
+
     void CommandList::applyGraphicsStateToEncoder(id<MTLRenderCommandEncoder> encoder, const GraphicsState& state)
     {
         auto* pipeline = static_cast<GraphicsPipeline*>(state.pipeline);
@@ -1612,18 +1632,65 @@ namespace nvrhi::metal3
         }
     }
 
+    void CommandList::applyComputeBindings(id<MTLComputeCommandEncoder> encoder, const ComputeState& state)
+    {
+        for (IBindingSet* bindingSet : state.bindings)
+        {
+            auto* set = static_cast<BindingSet*>(bindingSet);
+            if (!set) continue;
+            referenceBindingSet(set);
+            for (const BindingSetItem& item : set->desc.bindings)
+            {
+                if (traceMetalRuntime() && !item.resourceHandle)
+                    m_Context.warning("[metal3-trace] compute binding has null resource: type=" +
+                        std::string(resourceTypeName(item.type)) + " slot=" + std::to_string(item.slot));
+                bindVolatileConstantBuffer(encoder, item);
+            }
+        }
+    }
+
     void CommandList::referenceBindingSet(BindingSet* bindingSet)
     {
         if (bindingSet)
             m_ReferencedBindingSets.push_back(bindingSet);
     }
-    
+
+    // ---- stubs ----
+
+    // no staging texture copy support
+    void CommandList::copyTexture(IStagingTexture* dest, const TextureSlice& destSlice, ITexture* src, const TextureSlice& srcSlice)
+    {
+        (void)dest;
+        (void)destSlice;
+        (void)src;
+        (void)srcSlice;
+    }
+
+    void CommandList::copyTexture(ITexture* dest, const TextureSlice& destSlice, IStagingTexture* src, const TextureSlice& srcSlice)
+    {
+        (void)dest;
+        (void)destSlice;
+        (void)src;
+        (void)srcSlice;
+    }
+
+    // TODO?: no push constant support yet
+    void CommandList::setPushConstants(const void* data, size_t byteSize)
+    {
+        m_PushConstantSize = std::min(byteSize, m_PushConstants.size());
+        if (data && m_PushConstantSize)
+            std::memcpy(m_PushConstants.data(), data, m_PushConstantSize);
+    }
+
     void CommandList::dispatchIndirect(uint32_t offsetBytes) { (void)offsetBytes; }
     void CommandList::setMeshletState(const MeshletState& state) { m_CurrentMeshletState = state; m_CurrentMeshletStateValid = true; }
     void CommandList::dispatchMesh(uint32_t groupsX, uint32_t groupsY, uint32_t groupsZ) { (void)groupsX; (void)groupsY; (void)groupsZ; }
+    void CommandList::dispatchMeshIndirect(uint32_t offsetBytes, uint32_t maxDrawCount) { (void)offsetBytes; (void)maxDrawCount; }
+    void CommandList::dispatchMeshIndirectCount(uint32_t paramOffsetBytes, uint32_t countOffsetBytes, uint32_t maxDrawCount) { (void)paramOffsetBytes; (void)countOffsetBytes; (void)maxDrawCount; }
     void CommandList::setRayTracingState(const rt::State& state) { m_CurrentRayTracingState = state; m_CurrentRayTracingStateValid = true; }
     void CommandList::dispatchRays(const rt::DispatchRaysArguments& args) { (void)args; }
     void CommandList::buildOpacityMicromap(rt::IOpacityMicromap* omm, const rt::OpacityMicromapDesc& desc) { (void)omm; (void)desc; }
+    void CommandList::copyRaytracingAccelerationStructure(rt::IAccelStruct* destination, rt::IAccelStruct* source) { (void)destination; (void)source; }
     void CommandList::buildBottomLevelAccelStruct(rt::IAccelStruct* as, const rt::GeometryDesc* pGeometries, size_t numGeometries, rt::AccelStructBuildFlags buildFlags) { (void)as; (void)pGeometries; (void)numGeometries; (void)buildFlags; }
     void CommandList::compactBottomLevelAccelStructs() {}
     void CommandList::buildTopLevelAccelStruct(rt::IAccelStruct* as, const rt::InstanceDesc* pInstances, size_t numInstances, rt::AccelStructBuildFlags buildFlags) { (void)as; (void)pInstances; (void)numInstances; (void)buildFlags; }
@@ -1649,4 +1716,7 @@ namespace nvrhi::metal3
     void CommandList::clearSamplerFeedbackTexture(ISamplerFeedbackTexture* texture) { (void)texture; }
     void CommandList::decodeSamplerFeedbackTexture(IBuffer* buffer, ISamplerFeedbackTexture* texture, Format format) { (void)buffer; (void)texture; (void)format; }
     void CommandList::setSamplerFeedbackTextureState(ISamplerFeedbackTexture* texture, ResourceStates stateBits) { (void)texture; (void)stateBits; }
+    void CommandList::beginMarker(const char* name) { (void)name; }
+    void CommandList::endMarker() {}
+    nvrhi::IDevice* CommandList::getDevice() { return m_Device; }
 }

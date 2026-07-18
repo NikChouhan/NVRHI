@@ -3,6 +3,7 @@
 #include "nvrhi/common/resource.h"
 #include "nvrhi/utils.h"
 #include <Metal/Metal.h>
+#include <atomic>
 #include <cstdio>
 
 namespace nvrhi::metal3
@@ -404,5 +405,172 @@ namespace nvrhi::metal3
         default:
             return MTLPixelFormatInvalid;
         }
+    }
+
+    // ---- stubs ----
+    TimerQueryHandle Device::createTimerQuery()
+    {
+        return TimerQueryHandle::Create(new TimerQuery());
+    }
+
+    bool Device::pollTimerQuery(ITimerQuery* query)
+    {
+        auto* timer = static_cast<TimerQuery*>(query);
+        return timer && timer->resolved;
+    }
+
+    float Device::getTimerQueryTime(ITimerQuery* query)
+    {
+        auto* timer = static_cast<TimerQuery*>(query);
+        return timer ? timer->time : 0.f;
+    }
+
+    void Device::resetTimerQuery(ITimerQuery* query)
+    {
+        auto* timer = static_cast<TimerQuery*>(query);
+        if (!timer) return;
+        timer->resolved = true;
+        timer->time = 0.f;
+    }
+
+    MeshletPipelineHandle Device::createMeshletPipeline(const MeshletPipelineDesc& desc, FramebufferInfo const& fbinfo)
+    {
+        (void)desc;
+        (void)fbinfo;
+        return nullptr;
+    }
+
+    MeshletPipelineHandle Device::createMeshletPipeline(const MeshletPipelineDesc& desc, IFramebuffer* fb)
+    {
+        (void)desc;
+        (void)fb;
+        return nullptr;
+    }
+
+    BindingLayoutHandle Device::createBindlessLayout(const BindlessLayoutDesc& desc)
+    {
+        (void)desc;
+        return nullptr;
+    }
+
+    DescriptorTableHandle Device::createDescriptorTable(IBindingLayout* layout)
+    {
+        (void)layout;
+        return nullptr;
+    }
+
+    void Device::resizeDescriptorTable(IDescriptorTable* descriptorTable, uint32_t newSize, bool keepContents)
+    {
+        (void)descriptorTable;
+        (void)newSize;
+        (void)keepContents;
+    }
+
+    bool Device::writeDescriptorTable(IDescriptorTable* descriptorTable, const BindingSetItem& item)
+    {
+        (void)descriptorTable;
+        (void)item;
+        return false;
+    }
+
+    rt::OpacityMicromapHandle Device::createOpacityMicromap(const rt::OpacityMicromapDesc& desc)
+    {
+        auto* omm = new DummyOpacityMicromap();
+        omm->desc = desc;
+        return rt::OpacityMicromapHandle::Create(omm);
+    }
+
+    rt::AccelStructHandle Device::createAccelStruct(const rt::AccelStructDesc& desc)
+    {
+        auto* accel = new DummyAccelStruct();
+        accel->desc = desc;
+        return rt::AccelStructHandle::Create(accel);
+    }
+
+    MemoryRequirements Device::getAccelStructMemoryRequirements(rt::IAccelStruct* as)
+    {
+        (void)as;
+        return MemoryRequirements{};
+    }
+
+    rt::cluster::OperationSizeInfo Device::getClusterOperationSizeInfo(const rt::cluster::OperationParams& params)
+    {
+        (void)params;
+        return rt::cluster::OperationSizeInfo{};
+    }
+
+    bool Device::bindAccelStructMemory(rt::IAccelStruct* as, IHeap* heap, uint64_t offset)
+    {
+        (void)as;
+        (void)heap;
+        (void)offset;
+        return false;
+    }
+
+    nvrhi::CommandListHandle Device::createCommandList(const CommandListParameters& params)
+    {
+        return nvrhi::CommandListHandle::Create(new CommandList(this, m_Context, params));
+    }
+
+    uint64_t Device::executeCommandLists(nvrhi::ICommandList* const* pCommandLists, size_t numCommandLists, CommandQueue executionQueue)
+    {
+        (void)pCommandLists;
+        (void)numCommandLists;
+        (void)executionQueue;
+        static std::atomic<uint64_t> serial{1};
+        return serial.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void Device::queueWaitForCommandList(CommandQueue waitQueue, CommandQueue executionQueue, uint64_t instance)
+    {
+        (void)waitQueue;
+        (void)executionQueue;
+        (void)instance;
+    }
+
+    CommandListLifetimeTrackerHandle Device::createCommandListLifetimeTracker(CommandQueue executionQueue)
+    {
+        (void)executionQueue;
+        return nullptr;
+    }
+
+    FormatSupport Device::queryFormatSupport(Format format)
+    {
+        if (convertFormat(format) == MTLPixelFormatInvalid)
+            return FormatSupport::None;
+
+        const FormatInfo& info = getFormatInfo(format);
+        FormatSupport support = FormatSupport::Texture | FormatSupport::ShaderLoad | FormatSupport::ShaderSample;
+        if (info.hasDepth || info.hasStencil)
+            support = support | FormatSupport::DepthStencil;
+        else
+            support = support | FormatSupport::RenderTarget | FormatSupport::ShaderUavLoad | FormatSupport::ShaderUavStore;
+        return support;
+    }
+
+    coopvec::DeviceFeatures Device::queryCoopVecFeatures()
+    {
+        return coopvec::DeviceFeatures{};
+    }
+
+    coopvec::MatMulFormatSupport Device::queryCoopVecMatMulFormatSupport(const coopvec::MatMulFormatCombo& combination)
+    {
+        (void)combination;
+        return coopvec::MatMulFormatSupport{};
+    }
+
+    coopvec::TrainingFormatSupport Device::queryCoopVecTrainingFormatSupport(coopvec::DataType componentType)
+    {
+        (void)componentType;
+        return coopvec::TrainingFormatSupport{};
+    }
+
+    size_t Device::getCoopVecMatrixSize(coopvec::DataType type, coopvec::MatrixLayout layout, int rows, int columns)
+    {
+        (void)type;
+        (void)layout;
+        (void)rows;
+        (void)columns;
+        return 0;
     }
 }
