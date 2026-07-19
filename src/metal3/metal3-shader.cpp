@@ -2,6 +2,7 @@
 #include <dispatch/dispatch.h>
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <regex>
@@ -237,6 +238,24 @@ namespace nvrhi::metal3
         return false;
     }
 
+    static std::filesystem::path makeMscStageInLibraryPath(const std::string& debugName)
+    {
+        if (debugName.empty())
+            return {};
+
+        std::filesystem::path path(debugName);
+        if (path.extension() == ".metallib")
+        {
+            std::string value = path.string();
+            constexpr const char* suffix = ".metallib";
+            value.resize(value.size() - std::strlen(suffix));
+            value += ".stageIn.metallib";
+            return value;
+        }
+
+        return {};
+    }
+
     ShaderHandle Device::createShader(const ShaderDesc& d, const void* binary, size_t binarySize)
     {
         if (!binary || binarySize == 0)
@@ -263,9 +282,29 @@ namespace nvrhi::metal3
         shader->function = [shader->library newFunctionWithName:entry];
         if (!shader->function)
         {
+            NSString* objectEntry = [NSString stringWithFormat:@"%@.dxil_irconverter_object_shader", entry];
+            shader->function = [shader->library newFunctionWithName:objectEntry];
+        }
+        if (!shader->function)
+        {
             m_Context.error("[nvrhi] Failed to find Metal shader entry: " + d.entryName);
             delete shader;
             return nullptr;
+        }
+
+        std::filesystem::path stageInPath = makeMscStageInLibraryPath(d.debugName);
+        if (!stageInPath.empty() && std::filesystem::exists(stageInPath))
+        {
+            NSError* stageInError = nil;
+            shader->stageInLibrary = [m_Context.device newLibraryWithURL:[NSURL fileURLWithPath:[NSString stringWithUTF8String:stageInPath.string().c_str()]]
+                                                                    error:&stageInError];
+            if (!shader->stageInLibrary)
+            {
+                std::string message = "[metal3] failed to load MSC stage-in library '" + stageInPath.string() + "'";
+                if (stageInError)
+                    message += std::string(": ") + [[stageInError localizedDescription] UTF8String];
+                m_Context.warning(message);
+            }
         }
 
         if (!d.debugName.empty())

@@ -239,6 +239,7 @@ namespace nvrhi::metal3
     public:
         ShaderDesc desc;
         id<MTLLibrary> library = nil;
+        id<MTLLibrary> stageInLibrary = nil;
         id<MTLFunction> function = nil;
         std::vector<uint8_t> bytecode;
         MscShaderReflection mscReflection;
