@@ -549,6 +549,7 @@ namespace nvrhi::metal3
         bool m_CurrentComputeStateValid = false;
         bool m_CurrentMeshletStateValid = false;
         bool m_CurrentRayTracingStateValid = false;
+        bool m_GeometryEmulationDrawStateValid = false;
 
         bool m_BindingStatesDirty = false;
 
@@ -580,8 +581,11 @@ namespace nvrhi::metal3
         id<MTLRenderCommandEncoder> getOrCreateRenderEncoder();
         id<MTLComputeCommandEncoder> getOrCreateComputeEncoder();
         id<MTLBuffer> getOrCreateArgumentTable(const MetalStageBindingPlan& plan, const BindingSetVector& bindingSets);
-        bool bindVolatileConstantBuffer(id<MTLRenderCommandEncoder> encoder, const BindingSetItem& item);
+        void bindGraphicsArgumentTable(id<MTLRenderCommandEncoder> encoder, const BindingSetVector& bindingSets, const MetalStageBindingPlan& plan, MTLRenderStages stages);
+        bool bindVolatileConstantBuffer(id<MTLRenderCommandEncoder> encoder, const MetalBindingResource& resource, uint32_t slot, MTLRenderStages stages);
         bool bindVolatileConstantBuffer(id<MTLComputeCommandEncoder> encoder, const BindingSetItem& item);
+        void bindVolatileConstantBuffersForStage(id<MTLRenderCommandEncoder> encoder, const BindingSetVector& bindingSets, const MetalStageBindingPlan& plan, MTLRenderStages stages);
+        bool bindGeometryEmulationVertexBuffers(id<MTLRenderCommandEncoder> encoder, const GraphicsPipeline& pipeline, const GraphicsState& state);
         void applyGraphicsStateToEncoder(id<MTLRenderCommandEncoder> encoder, const GraphicsState& state);
         void applyGraphicsBindings(id<MTLRenderCommandEncoder> encoder, const GraphicsState& state);
         void applyComputeBindings(id<MTLComputeCommandEncoder> encoder, const ComputeState& state);

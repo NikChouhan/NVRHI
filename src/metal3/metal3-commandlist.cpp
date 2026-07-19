@@ -15,6 +15,7 @@ namespace nvrhi::metal3
     // predefined bind point values for shaders converted with metal shader converter
     static constexpr uint32_t c_MscVertexBufferBindPoint = 6;
     static constexpr uint32_t c_IrDrawArgumentsBindPoint = 4;
+    static constexpr uint32_t c_IrRuntimeVertexBufferCount = 31;
 
     struct IcbIndexedIndirectParams
     {
@@ -335,6 +336,23 @@ namespace nvrhi::metal3
         return false;
     }
 
+    static IRRuntimePrimitiveType convertRuntimePrimitiveType(PrimitiveType primitiveType)
+    {
+        switch (primitiveType)
+        {
+        case PrimitiveType::PointList: return IRRuntimePrimitiveTypePoint;
+        case PrimitiveType::LineList: return IRRuntimePrimitiveTypeLine;
+        case PrimitiveType::LineStrip: return IRRuntimePrimitiveTypeLineStrip;
+        case PrimitiveType::TriangleStrip: return IRRuntimePrimitiveTypeTriangleStrip;
+        case PrimitiveType::TriangleListWithAdjacency: return IRRuntimePrimitiveTypeTriangleWithAdj;
+        case PrimitiveType::TriangleStripWithAdjacency: return IRRuntimePrimitiveTypeTriangleWithAdj;
+        case PrimitiveType::TriangleList:
+        case PrimitiveType::TriangleFan:
+        default:
+            return IRRuntimePrimitiveTypeTriangle;
+        }
+    }
+
     // Metal binding model:
     // - regular CB/SRV/UAV/sampler bindings are encoded into Metal Shader
     //   Converter descriptor tables using the reflected per-stage plan.
@@ -367,7 +385,32 @@ namespace nvrhi::metal3
                 continue;
 
             if (entry.slot + entry.arrayElement == planEntry.slot)
-                return &entry;
+            return &entry;
+        }
+
+        return nullptr;
+    }
+
+    static const MetalBindingResource* findVolatileConstantBufferResource(
+        const BindingSetVector& bindingSets,
+        const MetalBindingPlanEntry& planEntry)
+    {
+        if (!usesDirectVolatileConstantBufferBinding(planEntry) ||
+            planEntry.layoutIndex >= bindingSets.size())
+            return nullptr;
+
+        auto* set = static_cast<BindingSet*>(bindingSets[planEntry.layoutIndex]);
+        if (!set)
+            return nullptr;
+
+        for (const MetalBindingResource& entry : set->entries)
+        {
+            if (entry.type != ResourceType::VolatileConstantBuffer ||
+                entry.slot + entry.arrayElement != planEntry.slot ||
+                entry.registerSpace != planEntry.space)
+                continue;
+
+            return &entry;
         }
 
         return nullptr;
@@ -693,6 +736,7 @@ namespace nvrhi::metal3
         trackedCmdBuffer = [m_Context.commonQueue commandBuffer];
         m_CurrentGraphicsStateValid = false;
         m_CurrentComputeStateValid = false;
+        m_GeometryEmulationDrawStateValid = false;
         m_RenderEncoder = nil;
         m_ComputeEncoder = nil;
     }
@@ -710,6 +754,7 @@ namespace nvrhi::metal3
         m_CurrentComputeState = ComputeState();
         m_CurrentGraphicsStateValid = false;
         m_CurrentComputeStateValid = false;
+        m_GeometryEmulationDrawStateValid = false;
         endEncoding();
     }
 
@@ -1144,6 +1189,30 @@ namespace nvrhi::metal3
                 m_Context.warning("[metal3-trace] draw skipped: encoder/pipeline missing");
             return;
         }
+        if (pipeline->usesGeometryEmulation)
+        {
+            if (!m_GeometryEmulationDrawStateValid)
+            {
+                if (traceMetalRuntime())
+                    m_Context.warning("[metal3-trace] draw skipped: geometry-emulation state was not fully bound");
+                return;
+            }
+
+            IRRuntimeGeometryPipelineConfig config{};
+            config.gsVertexSizeInBytes = pipeline->geometryVertexSizeInBytes;
+            config.gsMaxInputPrimitivesPerMeshThreadgroup =
+                pipeline->geometryMaxInputPrimitivesPerMeshThreadgroup;
+
+            IRRuntimeDrawPrimitivesGeometryEmulation(encoder,
+                convertRuntimePrimitiveType(pipeline->desc.primType),
+                config,
+                args.instanceCount,
+                args.vertexCount,
+                args.startVertexLocation,
+                args.startInstanceLocation);
+            return;
+        }
+
         IRRuntimeDrawPrimitives(encoder, pipeline->primitiveType, args.startVertexLocation, args.vertexCount, args.instanceCount, args.startInstanceLocation);
     }
 
@@ -1160,6 +1229,48 @@ namespace nvrhi::metal3
                 m_Context.warning("[metal3-trace] drawIndexed skipped: encoder/pipeline/index missing");
             return;
         }
+        if (pipeline->usesGeometryEmulation)
+        {
+            if (!m_GeometryEmulationDrawStateValid)
+            {
+                if (traceMetalRuntime())
+                    m_Context.warning("[metal3-trace] drawIndexed skipped: geometry-emulation state was not fully bound");
+                return;
+            }
+            if (!indexBuffer->buffer)
+                return;
+
+            IRRuntimeGeometryPipelineConfig config{};
+            config.gsVertexSizeInBytes = pipeline->geometryVertexSizeInBytes;
+            config.gsMaxInputPrimitivesPerMeshThreadgroup =
+                pipeline->geometryMaxInputPrimitivesPerMeshThreadgroup;
+
+            const uint32_t indexSize = m_CurrentGraphicsState.indexBuffer.format == Format::R32_UINT ? 4u : 2u;
+            if (m_CurrentGraphicsState.indexBuffer.offset % indexSize != 0 && traceMetalRuntime())
+                m_Context.warning("[metal3-trace] geometry-emulation indexed draw has an unaligned index buffer offset");
+
+            const uint32_t startIndex =
+                uint32_t(m_CurrentGraphicsState.indexBuffer.offset / indexSize) + args.startIndexLocation;
+            if (@available(macOS 13.0, *))
+            {
+                [encoder useResource:indexBuffer->buffer
+                                usage:MTLResourceUsageRead
+                               stages:MTLRenderStageObject | MTLRenderStageMesh];
+            }
+
+            IRRuntimeDrawIndexedPrimitivesGeometryEmulation(encoder,
+                convertRuntimePrimitiveType(pipeline->desc.primType),
+                convertIndexFormat(m_CurrentGraphicsState.indexBuffer.format),
+                indexBuffer->buffer,
+                config,
+                args.instanceCount,
+                args.vertexCount,
+                startIndex,
+                args.startVertexLocation,
+                args.startInstanceLocation);
+            return;
+        }
+
         IRRuntimeDrawIndexedPrimitives(encoder, pipeline->primitiveType, args.vertexCount, convertIndexFormat(m_CurrentGraphicsState.indexBuffer.format), indexBuffer->buffer, m_CurrentGraphicsState.indexBuffer.offset + args.startIndexLocation * (m_CurrentGraphicsState.indexBuffer.format == Format::R32_UINT ? 4 : 2), args.instanceCount, args.startVertexLocation, args.startInstanceLocation);
     }
 
@@ -1439,6 +1550,8 @@ namespace nvrhi::metal3
         if (!encoder || !pipeline)
             return;
 
+        m_GeometryEmulationDrawStateValid = false;
+
         [encoder setRenderPipelineState:pipeline->pipeline];
         [encoder setDepthStencilState:pipeline->depthStencilState];
         [encoder setCullMode:pipeline->cullMode];
@@ -1457,54 +1570,78 @@ namespace nvrhi::metal3
             [encoder setVertexBuffer:buffer ? buffer->buffer : nil offset:NSUInteger(vb.offset) atIndex:vb.slot];
             [encoder setVertexBuffer:buffer ? buffer->buffer : nil offset:NSUInteger(vb.offset) atIndex:c_MscVertexBufferBindPoint + vb.slot];
         }
-        // path for finding and binding volatile command buffers
+
+        // Keep binding sets alive and report null resources once from the common
+        // graphics path. Volatile CBs are bound below from the reflected per-stage
+        // plans so object/mesh/fragment only receive the buffers they use.
         applyGraphicsBindings(encoder, state);
 
-        // for binding the rest of the textures, buffers, resources
-        // argument table is prepared (build or used from before)
-        id<MTLBuffer> vertexArgumentBuffer = getOrCreateArgumentTable(pipeline->vertexBindingPlan, state.bindings);
-        if (vertexArgumentBuffer)
+        if (pipeline->usesGeometryEmulation)
         {
-            m_ReferencedNativeBuffers.push_back(vertexArgumentBuffer);
-            [encoder setVertexBuffer:vertexArgumentBuffer offset:0 atIndex:kIRArgumentBufferBindPoint];
-            [encoder useResource:vertexArgumentBuffer usage:MTLResourceUsageRead];
-            useArgumentTableResources(encoder, state.bindings, pipeline->vertexBindingPlan, MTLRenderStageVertex);
+            if (@available(macOS 13.0, *))
+            {
+                m_GeometryEmulationDrawStateValid = bindGeometryEmulationVertexBuffers(encoder, *pipeline, state);
+                bindVolatileConstantBuffersForStage(encoder, state.bindings, pipeline->objectBindingPlan, MTLRenderStageObject);
+                bindVolatileConstantBuffersForStage(encoder, state.bindings, pipeline->meshBindingPlan, MTLRenderStageMesh);
+                bindGraphicsArgumentTable(encoder, state.bindings, pipeline->objectBindingPlan, MTLRenderStageObject);
+                bindGraphicsArgumentTable(encoder, state.bindings, pipeline->meshBindingPlan, MTLRenderStageMesh);
+                if (pipeline->desc.PS)
+                {
+                    bindVolatileConstantBuffersForStage(encoder, state.bindings, pipeline->fragmentBindingPlan, MTLRenderStageFragment);
+                    bindGraphicsArgumentTable(encoder, state.bindings, pipeline->fragmentBindingPlan, MTLRenderStageFragment);
+                }
+            }
+            else if (traceMetalRuntime())
+            {
+                m_Context.warning("[metal3-trace] geometry-emulation graphics state requires object/mesh stage binding support");
+            }
+            return;
         }
 
+        bindVolatileConstantBuffersForStage(encoder, state.bindings, pipeline->vertexBindingPlan, MTLRenderStageVertex);
+        bindGraphicsArgumentTable(encoder, state.bindings, pipeline->vertexBindingPlan, MTLRenderStageVertex);
         if (pipeline->desc.PS)
         {
-            id<MTLBuffer> fragmentArgumentBuffer = getOrCreateArgumentTable(pipeline->fragmentBindingPlan, state.bindings);
-            if (fragmentArgumentBuffer)
-            {
-                m_ReferencedNativeBuffers.push_back(fragmentArgumentBuffer);
-                [encoder setFragmentBuffer:fragmentArgumentBuffer offset:0 atIndex:kIRArgumentBufferBindPoint];
-                [encoder useResource:fragmentArgumentBuffer usage:MTLResourceUsageRead];
-                useArgumentTableResources(encoder, state.bindings, pipeline->fragmentBindingPlan, MTLRenderStageFragment);
-            }
+            bindVolatileConstantBuffersForStage(encoder, state.bindings, pipeline->fragmentBindingPlan, MTLRenderStageFragment);
+            bindGraphicsArgumentTable(encoder, state.bindings, pipeline->fragmentBindingPlan, MTLRenderStageFragment);
         }
     }
 
-    bool CommandList::bindVolatileConstantBuffer(id<MTLRenderCommandEncoder> encoder, const BindingSetItem& item)
+    bool CommandList::bindVolatileConstantBuffer(
+        id<MTLRenderCommandEncoder> encoder,
+        const MetalBindingResource& resource,
+        uint32_t slot,
+        MTLRenderStages stages)
     {
-        if (item.type != ResourceType::VolatileConstantBuffer)
+        if (resource.type != ResourceType::VolatileConstantBuffer)
             return false;
 
-        auto* buffer = static_cast<Buffer*>(item.resourceHandle);
+        auto* buffer = static_cast<Buffer*>(resource.resource.Get());
         auto allocationIt = buffer ? m_VolatileBufferAllocations.find(buffer) : m_VolatileBufferAllocations.end();
         if (!buffer || allocationIt == m_VolatileBufferAllocations.end() || !allocationIt->second.buffer)
         {
             if (traceMetalRuntime())
                 m_Context.warning("[metal3-trace] volatile constant buffer not written before graphics bind: slot=" +
-                    std::to_string(item.slot) + " name='" + (buffer ? buffer->desc.debugName : std::string("<null>")) + "'");
+                    std::to_string(slot) + " name='" + (buffer ? buffer->desc.debugName : std::string("<null>")) + "'");
             return false;
         }
 
-        const BufferRange range = item.range.resolve(buffer->desc);
         const UploadAllocation& allocation = allocationIt->second;
-        const NSUInteger offset = allocation.offset + NSUInteger(range.byteOffset);
-        [encoder setVertexBuffer:allocation.buffer offset:offset atIndex:item.slot];
-        [encoder setFragmentBuffer:allocation.buffer offset:offset atIndex:item.slot];
-        [encoder useResource:allocation.buffer usage:MTLResourceUsageRead stages:MTLRenderStageVertex | MTLRenderStageFragment];
+        const NSUInteger offset = allocation.offset + resource.bufferOffset;
+
+        if (stages & MTLRenderStageVertex)
+            [encoder setVertexBuffer:allocation.buffer offset:offset atIndex:slot];
+        if (stages & MTLRenderStageFragment)
+            [encoder setFragmentBuffer:allocation.buffer offset:offset atIndex:slot];
+        if (@available(macOS 13.0, *))
+        {
+            if (stages & MTLRenderStageObject)
+                [encoder setObjectBuffer:allocation.buffer offset:offset atIndex:slot];
+            if (stages & MTLRenderStageMesh)
+                [encoder setMeshBuffer:allocation.buffer offset:offset atIndex:slot];
+        }
+
+        [encoder useResource:allocation.buffer usage:MTLResourceUsageRead stages:stages];
         return true;
     }
 
@@ -1613,10 +1750,184 @@ namespace nvrhi::metal3
         return argumentBuffer;
     }
 
+    void CommandList::bindGraphicsArgumentTable(
+        id<MTLRenderCommandEncoder> encoder,
+        const BindingSetVector& bindingSets,
+        const MetalStageBindingPlan& plan,
+        MTLRenderStages stages)
+    {
+        id<MTLBuffer> argumentBuffer = getOrCreateArgumentTable(plan, bindingSets);
+        if (!argumentBuffer)
+            return;
+
+        m_ReferencedNativeBuffers.push_back(argumentBuffer);
+
+        if ((stages & MTLRenderStageVertex) != 0)
+            [encoder setVertexBuffer:argumentBuffer offset:0 atIndex:kIRArgumentBufferBindPoint];
+        if ((stages & MTLRenderStageFragment) != 0)
+            [encoder setFragmentBuffer:argumentBuffer offset:0 atIndex:kIRArgumentBufferBindPoint];
+        if (@available(macOS 13.0, *))
+        {
+            if ((stages & MTLRenderStageObject) != 0)
+                [encoder setObjectBuffer:argumentBuffer offset:0 atIndex:kIRArgumentBufferBindPoint];
+            if ((stages & MTLRenderStageMesh) != 0)
+                [encoder setMeshBuffer:argumentBuffer offset:0 atIndex:kIRArgumentBufferBindPoint];
+        }
+
+        [encoder useResource:argumentBuffer usage:MTLResourceUsageRead stages:stages];
+        useArgumentTableResources(encoder, bindingSets, plan, stages);
+    }
+
+    void CommandList::bindVolatileConstantBuffersForStage(
+        id<MTLRenderCommandEncoder> encoder,
+        const BindingSetVector& bindingSets,
+        const MetalStageBindingPlan& plan,
+        MTLRenderStages stages)
+    {
+        for (const MetalBindingPlanEntry& planEntry : plan.entries)
+        {
+            if (!usesDirectVolatileConstantBufferBinding(planEntry))
+                continue;
+
+            if (@available(macOS 13.0, *))
+            {
+                if ((stages & MTLRenderStageObject) != 0 && planEntry.slot == 0)
+                {
+                    if (traceMetalRuntime())
+                        m_Context.warning("[metal3-trace] object-stage volatile constant buffer at slot 0 conflicts with IRRuntimeVertexBuffers");
+                    continue;
+                }
+            }
+
+            const MetalBindingResource* resource = findVolatileConstantBufferResource(bindingSets, planEntry);
+            if (!resource)
+            {
+                if (traceMetalRuntime())
+                {
+                    static int missingVolatileResourceLogCount = 0;
+                    if (missingVolatileResourceLogCount++ < 32)
+                        m_Context.warning("[metal3-trace] no volatile constant buffer resource for reflected " +
+                            std::string(utils::ShaderStageToString(plan.stage)) +
+                            " binding: slot=" + std::to_string(planEntry.slot) +
+                            " space=" + std::to_string(planEntry.space));
+                }
+                continue;
+            }
+
+            bindVolatileConstantBuffer(encoder, *resource, planEntry.slot, stages);
+        }
+    }
+
+    bool CommandList::bindGeometryEmulationVertexBuffers(
+        id<MTLRenderCommandEncoder> encoder,
+        const GraphicsPipeline& pipeline,
+        const GraphicsState& state)
+    {
+        auto* inputLayout = static_cast<InputLayout*>(pipeline.desc.inputLayout.Get());
+        if (!inputLayout)
+        {
+            if (traceMetalRuntime())
+                m_Context.warning("[metal3-trace] geometry-emulation pipeline has no input layout for IRRuntimeVertexBuffers");
+            return false;
+        }
+
+        std::array<uint32_t, c_IrRuntimeVertexBufferCount> strides{};
+        std::array<bool, c_IrRuntimeVertexBufferCount> requiredSlots{};
+        for (const VertexAttributeDesc& attr : inputLayout->attributes)
+        {
+            if (attr.bufferIndex >= c_IrRuntimeVertexBufferCount)
+            {
+                if (traceMetalRuntime())
+                    m_Context.warning("[metal3-trace] geometry-emulation vertex buffer slot exceeds IRRuntimeVertexBuffers capacity: slot=" +
+                        std::to_string(attr.bufferIndex));
+                return false;
+            }
+
+            requiredSlots[attr.bufferIndex] = true;
+            if (strides[attr.bufferIndex] != 0 && strides[attr.bufferIndex] != attr.elementStride && traceMetalRuntime())
+            {
+                m_Context.warning("[metal3-trace] geometry-emulation input layout has mismatched strides for slot " +
+                    std::to_string(attr.bufferIndex));
+            }
+            strides[attr.bufferIndex] = attr.elementStride;
+        }
+
+        IRRuntimeVertexBuffers vertexBuffers{};
+        std::array<bool, c_IrRuntimeVertexBufferCount> boundSlots{};
+        for (const VertexBufferBinding& vb : state.vertexBuffers)
+        {
+            if (vb.slot >= c_IrRuntimeVertexBufferCount)
+            {
+                if (traceMetalRuntime())
+                    m_Context.warning("[metal3-trace] geometry-emulation vertex buffer slot exceeds IRRuntimeVertexBuffers capacity: slot=" +
+                        std::to_string(vb.slot));
+                return false;
+            }
+
+            if (!requiredSlots[vb.slot])
+                continue;
+
+            auto* buffer = static_cast<Buffer*>(vb.buffer);
+            if (!buffer || !buffer->buffer)
+            {
+                if (traceMetalRuntime())
+                    m_Context.warning("[metal3-trace] geometry-emulation vertex buffer is null at required slot " +
+                        std::to_string(vb.slot));
+                return false;
+            }
+            if (strides[vb.slot] == 0)
+            {
+                if (traceMetalRuntime())
+                    m_Context.warning("[metal3-trace] geometry-emulation input layout has zero stride for slot " +
+                        std::to_string(vb.slot));
+                return false;
+            }
+            if (vb.offset > buffer->desc.byteSize)
+            {
+                if (traceMetalRuntime())
+                    m_Context.warning("[metal3-trace] geometry-emulation vertex buffer offset exceeds buffer size at slot " +
+                        std::to_string(vb.slot));
+                return false;
+            }
+
+            const uint64_t remainingBytes = buffer->desc.byteSize - vb.offset;
+            vertexBuffers[vb.slot].addr = buffer->getGpuVirtualAddress() + vb.offset;
+            vertexBuffers[vb.slot].length = uint32_t(std::min<uint64_t>(remainingBytes, std::numeric_limits<uint32_t>::max()));
+            vertexBuffers[vb.slot].stride = strides[vb.slot];
+            boundSlots[vb.slot] = true;
+
+            [encoder useResource:buffer->buffer usage:MTLResourceUsageRead stages:MTLRenderStageObject];
+        }
+
+        for (uint32_t slot = 0; slot < c_IrRuntimeVertexBufferCount; ++slot)
+        {
+            if (requiredSlots[slot] && !boundSlots[slot])
+            {
+                if (traceMetalRuntime())
+                    m_Context.warning("[metal3-trace] geometry-emulation missing required vertex buffer slot " +
+                        std::to_string(slot));
+                return false;
+            }
+        }
+
+        UploadAllocation allocation = m_UploadManager.suballocate(sizeof(IRRuntimeVertexBuffers), 256);
+        if (!allocation.buffer || !allocation.cpuAddress)
+            return false;
+
+        std::memcpy(allocation.cpuAddress, vertexBuffers, sizeof(IRRuntimeVertexBuffers));
+        m_ReferencedNativeBuffers.push_back(allocation.buffer);
+        [encoder setObjectBuffer:allocation.buffer offset:allocation.offset atIndex:0];
+        [encoder useResource:allocation.buffer usage:MTLResourceUsageRead stages:MTLRenderStageObject];
+        return true;
+    }
+
     // this path basically exclusively exists for binding volatile contant buffers
-    // regular resources go through the argument table path
+    // regular resources go through the argument table path. For graphics,
+    // volatile CB binding itself is driven by reflected per-stage plans so GS
+    // emulation does not bind unused object/mesh/fragment stage buffers.
     void CommandList::applyGraphicsBindings(id<MTLRenderCommandEncoder> encoder, const GraphicsState& state)
     {
+        (void)encoder;
         for (IBindingSet* bindingSet : state.bindings)
         {
             auto* set = static_cast<BindingSet*>(bindingSet);
@@ -1627,7 +1938,6 @@ namespace nvrhi::metal3
                 if (traceMetalRuntime() && !item.resourceHandle)
                     m_Context.warning("[metal3-trace] graphics binding has null resource: type=" +
                         std::string(resourceTypeName(item.type)) + " slot=" + std::to_string(item.slot));
-                bindVolatileConstantBuffer(encoder, item);
             }
         }
     }
