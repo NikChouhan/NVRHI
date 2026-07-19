@@ -370,6 +370,8 @@ namespace nvrhi::metal3
             return MTLPixelFormatRG16Float;
         case Format::RGBA16_FLOAT:
             return MTLPixelFormatRGBA16Float;
+        case Format::RGBA16_UNORM:
+            return MTLPixelFormatRGBA16Unorm;
         case Format::R32_FLOAT:
             return MTLPixelFormatR32Float;
         case Format::RG32_FLOAT:
