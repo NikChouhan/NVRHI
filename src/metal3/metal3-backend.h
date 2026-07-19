@@ -586,6 +586,8 @@ namespace nvrhi::metal3
         bool bindVolatileConstantBuffer(id<MTLComputeCommandEncoder> encoder, const BindingSetItem& item);
         void bindVolatileConstantBuffersForStage(id<MTLRenderCommandEncoder> encoder, const BindingSetVector& bindingSets, const MetalStageBindingPlan& plan, MTLRenderStages stages);
         bool bindGeometryEmulationVertexBuffers(id<MTLRenderCommandEncoder> encoder, const GraphicsPipeline& pipeline, const GraphicsState& state);
+        void drawIndirectGeometryEmulation(uint32_t offsetBytes, uint32_t drawCount);
+        void drawIndexedIndirectGeometryEmulation(uint32_t offsetBytes, uint32_t drawCount);
         void applyGraphicsStateToEncoder(id<MTLRenderCommandEncoder> encoder, const GraphicsState& state);
         void applyGraphicsBindings(id<MTLRenderCommandEncoder> encoder, const GraphicsState& state);
         void applyComputeBindings(id<MTLComputeCommandEncoder> encoder, const ComputeState& state);
