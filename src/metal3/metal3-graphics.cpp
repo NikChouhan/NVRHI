@@ -179,12 +179,18 @@ namespace nvrhi::metal3
             context.error("[metal3] geometry emulation pipeline has a shader without a Metal library");
             return false;
         }
+        if (!vs->stageInLibrary)
+        {
+            context.error("[metal3] geometry emulation VS '" + vs->desc.debugName +
+                "' has no MSC stage-in library");
+            return false;
+        }
         if (!vs->function || !gs->function || !ps->function)
         {
             context.error("[metal3] geometry emulation pipeline has a shader without a Metal entry function");
             return false;
         }
-        if (vs->library.functionNames.count == 0)
+        if (vs->stageInLibrary.functionNames.count == 0)
         {
             context.error("[metal3] geometry emulation vertex shader has no stage-in function candidates");
             return false;
@@ -249,7 +255,7 @@ namespace nvrhi::metal3
             const std::string psEntry = shaderEntryName(ps);
 
             IRGeometryEmulationPipelineDescriptor irDesc{};
-            irDesc.stageInLibrary = vs->library;
+            irDesc.stageInLibrary = vs->stageInLibrary;
             irDesc.vertexLibrary = vs->library;
             irDesc.vertexFunctionName = vsEntry.c_str();
             irDesc.geometryLibrary = gs->library;
