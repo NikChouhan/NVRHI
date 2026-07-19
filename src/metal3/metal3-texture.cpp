@@ -33,7 +33,8 @@ namespace nvrhi::metal3
         MTLPixelFormat pixelFormat = convertFormat(d.format);
         if (pixelFormat == MTLPixelFormatInvalid)
         {
-            m_Context.error("[nvrhi] Unsupported Metal texture format.");
+            m_Context.error("[nvrhi] Unsupported Metal texture format for texture '" + d.debugName +
+                "' (format=" + std::to_string(static_cast<int>(d.format)) + ").");
             return nullptr;
         }
 
