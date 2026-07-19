@@ -77,6 +77,17 @@ namespace nvrhi::metal3
     {
         std::smatch match;
         bool hasResourceCount = false;
+
+        // top-level MSC metadata describes the original HLSL stage and whether
+        // the generated Metal entry point needs function constants at creation.
+        std::regex shaderTypeRegex(R"name("ShaderType"\s*:\s*"([^"]+)")name");
+        if (std::regex_search(json, match, shaderTypeRegex))
+            reflection.shaderType = match[1].str();
+
+        std::regex needsFunctionConstantsRegex(R"("NeedsFunctionConstants"\s*:\s*(true|false))");
+        if (std::regex_search(json, match, needsFunctionConstantsRegex))
+            reflection.needsFunctionConstants = match[1].str() == "true";
+
         std::regex resourceCountRegex(R"("ResourceCount"\s*:\s*([0-9]+))");
         if (std::regex_search(json, match, resourceCountRegex))
         {
@@ -139,6 +150,26 @@ namespace nvrhi::metal3
                         static_cast<uint32_t>(std::stoul(indexMatch[1].str()));
             }
         }
+
+        // size of one VS output record consumed by the emulated GS mesh stage.
+        std::regex vertexOutputSizeRegex(R"("vertex_output_size_in_bytes"\s*:\s*([0-9]+))");
+        if (std::regex_search(json, match, vertexOutputSizeRegex))
+            reflection.vertexOutputSizeInBytes = static_cast<uint32_t>(std::stoul(match[1].str()));
+
+        // max number of source primitives the generated mesh threadgroup processes.
+        std::regex maxInputPrimsRegex(R"("max_input_primitives_per_mesh_threadgroup"\s*:\s*([0-9]+))");
+        if (std::regex_search(json, match, maxInputPrimsRegex))
+            reflection.maxInputPrimitivesPerMeshThreadgroup = static_cast<uint32_t>(std::stoul(match[1].str()));
+
+        // GS instance count used by the IRConverter emulation config.
+        std::regex instanceCountRegex(R"("instance_count"\s*:\s*([0-9]+))");
+        if (std::regex_search(json, match, instanceCountRegex))
+            reflection.geometryInstanceCount = static_cast<uint32_t>(std::stoul(match[1].str()));
+
+        // source primitive topology expected by the converted geometry shader.
+        std::regex inputPrimitiveRegex(R"name("input_primitive"\s*:\s*"([^"]+)")name");
+        if (std::regex_search(json, match, inputPrimitiveRegex))
+            reflection.inputPrimitive = match[1].str();
         
         // parse compute threads from reflection data, *tg_size*
         if (computeThreads)

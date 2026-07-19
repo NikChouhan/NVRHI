@@ -61,7 +61,13 @@ namespace nvrhi::metal3
     struct MscShaderReflection
     {
         bool valid = false;
+        bool needsFunctionConstants = false;
         uint32_t resourceCount = 0;
+        uint32_t vertexOutputSizeInBytes = 0;
+        uint32_t maxInputPrimitivesPerMeshThreadgroup = 0;
+        uint32_t geometryInstanceCount = 1;
+        std::string shaderType;
+        std::string inputPrimitive;
         std::vector<MscArgumentBinding> topLevelArgumentBuffer;
         std::unordered_map<std::string, uint32_t> vertexInputAttributes;
     };
@@ -290,9 +296,16 @@ namespace nvrhi::metal3
         MTLPrimitiveType primitiveType = MTLPrimitiveTypeTriangle;
         MTLCullMode cullMode = MTLCullModeNone;
         MTLWinding frontWinding = MTLWindingClockwise;
+        bool usesGeometryEmulation = false;
+        uint32_t geometryVertexSizeInBytes = 0;
+        uint32_t geometryMaxInputPrimitivesPerMeshThreadgroup = 0;
+        uint32_t geometryInstanceCount = 1;
         MetalStageBindingPlan vertexBindingPlan;
+        // binding plan for object stage
+        // for emulated geometry pipeline, the pipeline transforms to:
+        // VS (object stage) -> GS -> PS
+        MetalStageBindingPlan objectBindingPlan;
         MetalStageBindingPlan fragmentBindingPlan;
-        // TODO: for mesh shaders
         MetalStageBindingPlan meshBindingPlan;
         const GraphicsPipelineDesc& getDesc() const override { return desc; }
         const FramebufferInfo& getFramebufferInfo() const override { return framebufferInfo; }
