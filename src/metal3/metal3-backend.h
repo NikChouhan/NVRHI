@@ -550,6 +550,10 @@ namespace nvrhi::metal3
         bool m_CurrentMeshletStateValid = false;
         bool m_CurrentRayTracingStateValid = false;
         bool m_GeometryEmulationDrawStateValid = false;
+        // Holds the uploaded IRRuntimeVertexBuffers table for the active
+        // geometry-emulation draw; object shaders read this to fetch app vertex buffers.
+        id<MTLBuffer> m_GeometryEmulationVertexBuffers = nil;
+        NSUInteger m_GeometryEmulationVertexBuffersOffset = 0;
 
         bool m_BindingStatesDirty = false;
 
@@ -588,6 +592,7 @@ namespace nvrhi::metal3
         bool bindGeometryEmulationVertexBuffers(id<MTLRenderCommandEncoder> encoder, const GraphicsPipeline& pipeline, const GraphicsState& state);
         void drawIndirectGeometryEmulation(uint32_t offsetBytes, uint32_t drawCount);
         void drawIndexedIndirectGeometryEmulation(uint32_t offsetBytes, uint32_t drawCount);
+        void drawIndexedIndirectCountGeometryEmulation(uint32_t paramOffsetBytes, uint32_t countOffsetBytes, uint32_t maxDrawCount);
         void applyGraphicsStateToEncoder(id<MTLRenderCommandEncoder> encoder, const GraphicsState& state);
         void applyGraphicsBindings(id<MTLRenderCommandEncoder> encoder, const GraphicsState& state);
         void applyComputeBindings(id<MTLComputeCommandEncoder> encoder, const ComputeState& state);

@@ -48,6 +48,29 @@ namespace nvrhi::metal3
         id<MTLComputePipelineState> pipeline = nil;
     };
 
+    struct GeometryIndexedIndirectCountParams
+    {
+        uint32_t maxDrawCount = 0;
+        uint32_t paramOffsetBytes = 0;
+        uint32_t countOffsetBytes = 0;
+        uint32_t primitiveType = 0;
+        uint32_t gsVertexSizeInBytes = 0;
+        uint32_t gsMaxInputPrimitivesPerMeshThreadgroup = 0;
+        uint32_t indexType = 0;
+        uint32_t indexBufferOffsetInElements = 0;
+        uint64_t indexBufferAddress = 0;
+        uint32_t hasObjectArgumentTable = 0;
+        uint32_t hasMeshArgumentTable = 0;
+        uint32_t hasFragmentArgumentTable = 0;
+        uint32_t pad = 0;
+    };
+
+    struct GeometryIndexedIndirectCountIcbFillState
+    {
+        id<MTLComputePipelineState> pipeline = nil;
+        id<MTLArgumentEncoder> icbEncoder = nil;
+    };
+
     static const GeometryIndirectFillState& getGeometryIndirectFillState(const MTL3Context& context)
     {
         static std::mutex mutex;
@@ -333,6 +356,337 @@ namespace nvrhi::metal3
         if (!state.pipeline)
         {
             std::string message = "[metal3] failed to create geometry-indirect helper pipeline";
+            if (error)
+                message += std::string(": ") + [[error localizedDescription] UTF8String];
+            context.error(message);
+        }
+
+        return state;
+    }
+
+    // builds a compute shader used by geometry-emulation
+    // drawIndexedIndirectCount. The helper, reads NVRHI's indexed
+    // indirect args plus the GPU count buffer, and writes mesh draw commands into
+    // an MTLIndirectCommandBuffer. That avoids a CPU readback of the count and
+    // lets converted geometry shaders replay through Metal's object/mesh path.
+    static const GeometryIndexedIndirectCountIcbFillState& getGeometryIndexedIndirectCountIcbFillState(const MTL3Context& context)
+    {
+        static std::mutex mutex;
+        static GeometryIndexedIndirectCountIcbFillState state;
+        static bool attempted = false;
+
+        std::lock_guard<std::mutex> lock(mutex);
+        if (attempted)
+            return state;
+        attempted = true;
+
+        static constexpr const char* source = R"(
+            #include <metal_stdlib>
+            using namespace metal;
+
+            struct DrawIndexedIndirectArguments
+            {
+                uint indexCount;
+                uint instanceCount;
+                uint startIndexLocation;
+                int baseVertexLocation;
+                uint startInstanceLocation;
+            };
+
+            struct GeometryIndexedIndirectCountParams
+            {
+                uint maxDrawCount;
+                uint paramOffsetBytes;
+                uint countOffsetBytes;
+                uint primitiveType;
+                uint gsVertexSizeInBytes;
+                uint gsMaxInputPrimitivesPerMeshThreadgroup;
+                uint indexType;
+                uint indexBufferOffsetInElements;
+                ulong indexBufferAddress;
+                uint hasObjectArgumentTable;
+                uint hasMeshArgumentTable;
+                uint hasFragmentArgumentTable;
+                uint pad;
+            };
+
+            struct IcbArgumentBuffer
+            {
+                command_buffer icb [[id(0)]];
+            };
+
+            struct IRRuntimeDrawIndexedArgument
+            {
+                uint indexCountPerInstance;
+                uint instanceCount;
+                uint startIndexLocation;
+                int baseVertexLocation;
+                uint startInstanceLocation;
+            };
+
+            union IRRuntimeDrawParams
+            {
+                IRRuntimeDrawIndexedArgument drawIndexed;
+            };
+
+            struct IRRuntimeDrawInfo
+            {
+                ushort indexType;
+                uchar primitiveTopology;
+                uchar threadsPerPatch;
+                ushort maxInputPrimitivesPerMeshThreadgroup;
+                ushort objectThreadgroupVertexStride;
+                ushort meshThreadgroupPrimitiveStride;
+                ushort gsInstanceCount;
+                ushort patchesPerObjectThreadgroup;
+                ushort inputControlPointsPerPatch;
+                ulong indexBuffer;
+            };
+
+            constant uint kIRArgumentBufferBindPoint = 2;
+            constant uint kIRArgumentBufferDrawArgumentsBindPoint = 4;
+            constant uint kIRArgumentBufferUniformsBindPoint = 5;
+
+            static uint primitive_vertex_count(uint primitiveType)
+            {
+                switch (primitiveType)
+                {
+                case 0: return 1;
+                case 1: return 2;
+                case 2: return 2;
+                case 3: return 3;
+                case 4: return 3;
+                case 5: return 4;
+                case 6: return 6;
+                case 7: return 4;
+                default: return 0;
+                }
+            }
+
+            static uint primitive_vertex_overlap(uint primitiveType)
+            {
+                switch (primitiveType)
+                {
+                case 2: return 1;
+                case 4: return 2;
+                case 7: return 3;
+                default: return 0;
+                }
+            }
+
+            static IRRuntimeDrawInfo calculate_draw_info(
+                uint primitiveType,
+                uint gsVertexSizeInBytes,
+                uint maxInputPrimitivesPerMeshThreadgroup,
+                uint instanceCount,
+                uint indexType,
+                ulong indexBufferAddress)
+            {
+                const uint primitiveVertexCount = primitive_vertex_count(primitiveType);
+
+                IRRuntimeDrawInfo info;
+                info.indexType = ushort(indexType + 1);
+                info.primitiveTopology = uchar(primitiveType);
+                info.threadsPerPatch = uchar(primitiveVertexCount);
+                info.maxInputPrimitivesPerMeshThreadgroup = ushort(maxInputPrimitivesPerMeshThreadgroup);
+                info.objectThreadgroupVertexStride = 0;
+                info.meshThreadgroupPrimitiveStride = ushort(maxInputPrimitivesPerMeshThreadgroup);
+                info.gsInstanceCount = ushort(instanceCount);
+                info.patchesPerObjectThreadgroup = 0;
+                info.inputControlPointsPerPatch = ushort(primitiveVertexCount);
+                info.indexBuffer = indexBufferAddress;
+
+                if (primitiveVertexCount == 0 ||
+                    gsVertexSizeInBytes == 0 ||
+                    maxInputPrimitivesPerMeshThreadgroup == 0)
+                {
+                    return info;
+                }
+
+                const uint alignment = primitiveVertexCount;
+                const uint totalPayloadBytes = 16384;
+                const uint payloadBytesForMetadata = 32;
+                const uint payloadBytesForVertexData = totalPayloadBytes - payloadBytesForMetadata;
+                const uint maxVertexCountLimitedByPayloadMemory =
+                    (((payloadBytesForVertexData / gsVertexSizeInBytes)) / alignment) * alignment;
+                const uint maxMeshThreadgroupsPerObjectThreadgroup = 1024;
+                const uint maxPrimCountLimitedByAmplificationRate =
+                    maxMeshThreadgroupsPerObjectThreadgroup * maxInputPrimitivesPerMeshThreadgroup;
+                uint maxPrimsPerObjectThreadgroup = min(
+                    maxVertexCountLimitedByPayloadMemory / primitiveVertexCount,
+                    maxPrimCountLimitedByAmplificationRate);
+                const uint maxThreadsPerThreadgroup = 256;
+                maxPrimsPerObjectThreadgroup = min(
+                    maxPrimsPerObjectThreadgroup,
+                    maxThreadsPerThreadgroup / primitiveVertexCount);
+
+                info.objectThreadgroupVertexStride = ushort(maxPrimsPerObjectThreadgroup * primitiveVertexCount);
+                info.patchesPerObjectThreadgroup = ushort(maxPrimsPerObjectThreadgroup);
+                return info;
+            }
+
+            static uint3 calculate_object_threadgroup_count(
+                uint indexCount,
+                ushort objectThreadgroupVertexStride,
+                uint primitiveType,
+                uint instanceCount)
+            {
+                const uint overlap = primitive_vertex_overlap(primitiveType);
+                if (indexCount <= overlap || instanceCount == 0 || objectThreadgroupVertexStride == 0)
+                    return uint3(0, 0, 0);
+
+                const uint width =
+                    (indexCount - overlap + uint(objectThreadgroupVertexStride) - 1) /
+                    uint(objectThreadgroupVertexStride);
+                return uint3(width, instanceCount, 1);
+            }
+
+            kernel void nvrhi_metal3_fill_geometry_indexed_indirect_count_icb(
+                device const uchar* indirectParams [[buffer(0)]],
+                device const uchar* rawCount [[buffer(1)]],
+                device uint2* executionRange [[buffer(2)]],
+                constant IcbArgumentBuffer& icbArgumentBuffer [[buffer(3)]],
+                device IRRuntimeDrawInfo* drawInfos [[buffer(4)]],
+                device IRRuntimeDrawParams* drawParams [[buffer(5)]],
+                constant GeometryIndexedIndirectCountParams& params [[buffer(6)]],
+                device const uchar* vertexBufferTable [[buffer(7)]],
+                device const uchar* objectArgumentTable [[buffer(8)]],
+                device const uchar* meshArgumentTable [[buffer(9)]],
+                device const uchar* fragmentArgumentTable [[buffer(10)]],
+                uint tid [[thread_position_in_grid]])
+            {
+                device const uint* countPtr = reinterpret_cast<device const uint*>(rawCount + params.countOffsetBytes);
+                const uint gpuCount = min(*countPtr, params.maxDrawCount);
+
+                // Metal executes ICB commands through a GPU-readable execution
+                // range. Thread 0 converts NVRHI's count buffer into that range,
+                // keeping the whole counted draw on GPU without a readback.
+                if (tid == 0)
+                    executionRange[0] = uint2(0, gpuCount);
+
+                if (tid >= gpuCount)
+                    return;
+
+                // Each live thread owns one D3D/NVRHI indexed indirect record.
+                // The helper expands that compact draw record into the two
+                // IRRuntime records consumed by the generated object/mesh stages.
+                device const DrawIndexedIndirectArguments* args =
+                    reinterpret_cast<device const DrawIndexedIndirectArguments*>(indirectParams + params.paramOffsetBytes);
+                const DrawIndexedIndirectArguments a = args[tid];
+
+                IRRuntimeDrawInfo info = calculate_draw_info(params.primitiveType,
+                    params.gsVertexSizeInBytes,
+                    params.gsMaxInputPrimitivesPerMeshThreadgroup,
+                    a.instanceCount,
+                    params.indexType,
+                    params.indexBufferAddress);
+
+                IRRuntimeDrawParams runtimeParams;
+                runtimeParams.drawIndexed.indexCountPerInstance = a.indexCount;
+                runtimeParams.drawIndexed.instanceCount = a.instanceCount;
+                runtimeParams.drawIndexed.startIndexLocation =
+                    params.indexBufferOffsetInElements + a.startIndexLocation;
+                runtimeParams.drawIndexed.baseVertexLocation = a.baseVertexLocation;
+                runtimeParams.drawIndexed.startInstanceLocation = a.startInstanceLocation;
+
+                drawInfos[tid] = info;
+                drawParams[tid] = runtimeParams;
+
+                // Zero-sized draws still have valid runtime records, but do not
+                // need an ICB command because there is no mesh work to execute.
+                if (a.indexCount == 0 || a.instanceCount == 0)
+                    return;
+
+                const uint3 threadgroups = calculate_object_threadgroup_count(a.indexCount,
+                    info.objectThreadgroupVertexStride,
+                    params.primitiveType,
+                    a.instanceCount);
+                if (threadgroups.x == 0 || threadgroups.y == 0)
+                    return;
+
+                device const uchar* drawInfoBytes =
+                    reinterpret_cast<device const uchar*>(&drawInfos[tid]);
+                device const uchar* drawParamsBytes =
+                    reinterpret_cast<device const uchar*>(&drawParams[tid]);
+
+                // Geometry-emulation mesh shaders read the IR runtime draw
+                // metadata from object and mesh stages, matching the direct
+                // IRRuntimeDrawIndexedPrimitivesGeometryEmulation path.
+                // Because ICB commands do not inherit buffers in this path, the
+                // compute shader writes every table binding the replayed mesh draw
+                // will need: original vertex buffers, reflected argument tables,
+                // and the per-draw IRRuntime records generated above.
+                render_command command(icbArgumentBuffer.icb, tid);
+                command.set_object_buffer(vertexBufferTable, 0);
+                if (params.hasObjectArgumentTable != 0)
+                    command.set_object_buffer(objectArgumentTable, kIRArgumentBufferBindPoint);
+                if (params.hasMeshArgumentTable != 0)
+                    command.set_mesh_buffer(meshArgumentTable, kIRArgumentBufferBindPoint);
+                if (params.hasFragmentArgumentTable != 0)
+                    command.set_fragment_buffer(fragmentArgumentTable, kIRArgumentBufferBindPoint);
+                command.set_object_buffer(drawInfoBytes, kIRArgumentBufferUniformsBindPoint);
+                command.set_mesh_buffer(drawInfoBytes, kIRArgumentBufferUniformsBindPoint);
+                command.set_object_buffer(drawParamsBytes, kIRArgumentBufferDrawArgumentsBindPoint);
+                command.set_mesh_buffer(drawParamsBytes, kIRArgumentBufferDrawArgumentsBindPoint);
+                command.draw_mesh_threadgroups(threadgroups,
+                    uint3(info.objectThreadgroupVertexStride + primitive_vertex_overlap(params.primitiveType), 1, 1),
+                    uint3(params.gsMaxInputPrimitivesPerMeshThreadgroup, 1, 1));
+            }
+        )";
+
+        NSError* error = nil;
+        MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+        if (@available(macOS 14.0, *))
+            options.languageVersion = MTLLanguageVersion3_1;
+
+        id<MTLLibrary> library = [context.device newLibraryWithSource:[NSString stringWithUTF8String:source]
+                                                               options:options
+                                                                 error:&error];
+        if (!library)
+        {
+            std::string message = "[metal3] failed to compile geometry counted indexed-indirect ICB helper";
+            if (error)
+                message += std::string(": ") + [[error localizedDescription] UTF8String];
+            context.error(message);
+            return state;
+        }
+
+        id<MTLFunction> function = [library newFunctionWithName:@"nvrhi_metal3_fill_geometry_indexed_indirect_count_icb"];
+        if (!function)
+        {
+            context.error("[metal3] geometry counted indexed-indirect ICB helper function missing");
+            return state;
+        }
+
+        // The ICB is passed to the compute shader through an argument buffer;
+        // cache the encoder so each draw call only has to encode the ICB object.
+        state.icbEncoder = [function newArgumentEncoderWithBufferIndex:3];
+        if (!state.icbEncoder)
+        {
+            context.error("[metal3] failed to create geometry counted indexed-indirect ICB argument encoder");
+            return state;
+        }
+
+        if (@available(macOS 11.0, *))
+        {
+            MTLComputePipelineDescriptor* descriptor = [[MTLComputePipelineDescriptor alloc] init];
+            descriptor.computeFunction = function;
+            // Required because this compute pipeline writes render mesh commands
+            // into the ICB instead of only producing ordinary buffer data.
+            descriptor.supportIndirectCommandBuffers = YES;
+            state.pipeline = [context.device newComputePipelineStateWithDescriptor:descriptor
+                                                                           options:MTLPipelineOptionNone
+                                                                        reflection:nil
+                                                                             error:&error];
+        }
+        else
+        {
+            state.pipeline = [context.device newComputePipelineStateWithFunction:function error:&error];
+        }
+
+        if (!state.pipeline)
+        {
+            std::string message = "[metal3] failed to create geometry counted indexed-indirect ICB helper pipeline";
             if (error)
                 message += std::string(": ") + [[error localizedDescription] UTF8String];
             context.error(message);
@@ -1060,6 +1414,8 @@ namespace nvrhi::metal3
         m_CurrentGraphicsStateValid = false;
         m_CurrentComputeStateValid = false;
         m_GeometryEmulationDrawStateValid = false;
+        m_GeometryEmulationVertexBuffers = nil;
+        m_GeometryEmulationVertexBuffersOffset = 0;
         m_RenderEncoder = nil;
         m_ComputeEncoder = nil;
     }
@@ -1078,6 +1434,8 @@ namespace nvrhi::metal3
         m_CurrentGraphicsStateValid = false;
         m_CurrentComputeStateValid = false;
         m_GeometryEmulationDrawStateValid = false;
+        m_GeometryEmulationVertexBuffers = nil;
+        m_GeometryEmulationVertexBuffersOffset = 0;
         endEncoding();
     }
 
@@ -2063,6 +2421,15 @@ namespace nvrhi::metal3
             return;
         }
 
+        if (pipeline->usesGeometryEmulation)
+        {
+            // Converted geometry shaders run as Metal object/mesh pipelines, so
+            // the normal indexed-draw ICB path cannot replay them. Use the GS
+            // emulation path that writes mesh-threadgroup commands
+            drawIndexedIndirectCountGeometryEmulation(paramOffsetBytes, countOffsetBytes, maxDrawCount);
+            return;
+        }
+
         const IndexedIndirectIcbFillState& fillState = getIndexedIndirectIcbFillState(m_Context);
         if (!fillState.pipeline || !fillState.icbEncoder)
         {
@@ -2174,6 +2541,299 @@ namespace nvrhi::metal3
         [renderEncoder executeCommandsInBuffer:icb indirectBuffer:executionRange indirectBufferOffset:0];
     }
 
+    void CommandList::drawIndexedIndirectCountGeometryEmulation(
+        uint32_t paramOffsetBytes,
+        uint32_t countOffsetBytes,
+        uint32_t maxDrawCount)
+    {
+        if (maxDrawCount == 0)
+            return;
+        if (!m_GeometryEmulationDrawStateValid)
+        {
+            if (traceMetalRuntime())
+                m_Context.warning("[metal3-trace] drawIndexedIndirectCount skipped: geometry-emulation state was not fully bound");
+            return;
+        }
+
+        auto* pipeline = static_cast<GraphicsPipeline*>(m_CurrentGraphicsState.pipeline);
+        auto* indexBuffer = static_cast<Buffer*>(m_CurrentGraphicsState.indexBuffer.buffer);
+        auto* indirectParams = static_cast<Buffer*>(m_CurrentGraphicsState.indirectParams);
+        auto* indirectCount = static_cast<Buffer*>(m_CurrentGraphicsState.indirectCountBuffer);
+        if (!pipeline || !indexBuffer || !indexBuffer->buffer || !indirectParams || !indirectParams->buffer ||
+            !indirectCount || !indirectCount->buffer)
+        {
+            if (traceMetalRuntime())
+                m_Context.warning("[metal3-trace] geometry-emulation drawIndexedIndirectCount skipped: missing pipeline/index/args/count buffer");
+            return;
+        }
+
+        if (pipeline->geometryVertexSizeInBytes == 0 ||
+            pipeline->geometryMaxInputPrimitivesPerMeshThreadgroup == 0)
+        {
+            m_Context.warning("[metal3] geometry-emulation drawIndexedIndirectCount skipped: invalid GS reflection values");
+            return;
+        }
+
+        const uint64_t requiredParamBytes =
+            uint64_t(paramOffsetBytes) + uint64_t(maxDrawCount) * sizeof(DrawIndexedIndirectArguments);
+        if (requiredParamBytes > indirectParams->desc.byteSize)
+        {
+            m_Context.warning("[metal3-trace] geometry-emulation drawIndexedIndirectCount range exceeds args buffer: required=" +
+                std::to_string(requiredParamBytes) + " bufferSize=" + std::to_string(indirectParams->desc.byteSize) +
+                " args='" + indirectParams->desc.debugName + "'");
+            return;
+        }
+
+        const uint64_t requiredCountBytes = uint64_t(countOffsetBytes) + sizeof(uint32_t);
+        if (requiredCountBytes > indirectCount->desc.byteSize)
+        {
+            m_Context.warning("[metal3-trace] geometry-emulation drawIndexedIndirectCount count offset exceeds count buffer: required=" +
+                std::to_string(requiredCountBytes) + " bufferSize=" + std::to_string(indirectCount->desc.byteSize) +
+                " count='" + indirectCount->desc.debugName + "'");
+            return;
+        }
+
+        const uint32_t indexSize = m_CurrentGraphicsState.indexBuffer.format == Format::R32_UINT ? 4u : 2u;
+        if (m_CurrentGraphicsState.indexBuffer.offset % indexSize != 0)
+        {
+            m_Context.warning("[metal3-trace] geometry-emulation counted indexed indirect draw has an unaligned index buffer offset");
+            return;
+        }
+
+        if (@available(macOS 14.0, *))
+        {
+            // Counted geometry-emulation draws need compute-written mesh commands
+            // in an ICB. macOS 14 is the first version with the mesh ICB support
+            // this path relies on.
+            const GeometryIndexedIndirectCountIcbFillState& fillState =
+                getGeometryIndexedIndirectCountIcbFillState(m_Context);
+            if (!fillState.pipeline || !fillState.icbEncoder)
+            {
+                m_Context.warning("[metal3] geometry-emulation counted indexed indirect draw skipped because the ICB helper pipeline is unavailable");
+                return;
+            }
+            if (stageUsesDirectVolatileConstantBuffers(pipeline->objectBindingPlan) ||
+                stageUsesDirectVolatileConstantBuffers(pipeline->meshBindingPlan) ||
+                stageUsesDirectVolatileConstantBuffers(pipeline->fragmentBindingPlan))
+            {
+                m_Context.warning("[metal3] geometry-emulation counted indexed indirect draw skipped because direct volatile CBs need per-command ICB bindings");
+                return;
+            }
+
+            // The compute pass records complete ICB commands, so it needs stable
+            // buffers for every table the object/mesh/fragment stages will read
+            // when those commands are executed later by the render encoder.
+            id<MTLBuffer> vertexBufferTable = m_GeometryEmulationVertexBuffers;
+            const NSUInteger vertexBufferTableOffset = m_GeometryEmulationVertexBuffersOffset;
+            id<MTLBuffer> objectArgumentTable = getOrCreateArgumentTable(pipeline->objectBindingPlan, m_CurrentGraphicsState.bindings);
+            id<MTLBuffer> meshArgumentTable = getOrCreateArgumentTable(pipeline->meshBindingPlan, m_CurrentGraphicsState.bindings);
+            id<MTLBuffer> fragmentArgumentTable = pipeline->desc.PS
+                ? getOrCreateArgumentTable(pipeline->fragmentBindingPlan, m_CurrentGraphicsState.bindings)
+                : nil;
+            if (!vertexBufferTable ||
+                (pipeline->objectBindingPlan.resourceCount != 0 && !objectArgumentTable) ||
+                (pipeline->meshBindingPlan.resourceCount != 0 && !meshArgumentTable) ||
+                (pipeline->fragmentBindingPlan.resourceCount != 0 && !fragmentArgumentTable))
+            {
+                m_Context.warning("[metal3] geometry-emulation counted indexed indirect draw skipped because reflected state tables are missing");
+                return;
+            }
+
+            const NSUInteger drawInfoStride = sizeof(IRRuntimeDrawInfo);
+            const NSUInteger drawParamsStride = sizeof(IRRuntimeDrawParams);
+            const NSUInteger drawInfoSize = drawInfoStride * NSUInteger(maxDrawCount);
+            const NSUInteger drawParamsSize = drawParamsStride * NSUInteger(maxDrawCount);
+
+            MTLIndirectCommandBufferDescriptor* icbDesc = [[MTLIndirectCommandBufferDescriptor alloc] init];
+            icbDesc.commandTypes = MTLIndirectCommandTypeDrawMeshThreadgroups;
+            icbDesc.inheritPipelineState = YES;
+            // These commands need per-draw IR runtime buffers at slots 4/5, so
+            // they cannot inherit buffers from the parent encoder. Encode every
+            // object/mesh/fragment buffer the converted GS pipeline needs.
+            icbDesc.inheritBuffers = NO;
+            icbDesc.maxObjectBufferBindCount = std::max<NSUInteger>(
+                kIRArgumentBufferUniformsBindPoint + 1,
+                std::max<NSUInteger>(kIRArgumentBufferDrawArgumentsBindPoint + 1,
+                    kIRArgumentBufferBindPoint + 1));
+            icbDesc.maxMeshBufferBindCount = std::max<NSUInteger>(
+                kIRArgumentBufferUniformsBindPoint + 1,
+                std::max<NSUInteger>(kIRArgumentBufferDrawArgumentsBindPoint + 1,
+                    kIRArgumentBufferBindPoint + 1));
+            icbDesc.maxFragmentBufferBindCount = kIRArgumentBufferBindPoint + 1;
+
+            id<MTLIndirectCommandBuffer> icb =
+                [m_Context.device newIndirectCommandBufferWithDescriptor:icbDesc
+                                                         maxCommandCount:NSUInteger(maxDrawCount)
+                                                                options:MTLResourceStorageModePrivate];
+            id<MTLBuffer> executionRange =
+                [m_Context.device newBufferWithLength:sizeof(MTLIndirectCommandBufferExecutionRange)
+                                              options:MTLResourceStorageModePrivate];
+            id<MTLBuffer> drawInfoBuffer =
+                [m_Context.device newBufferWithLength:drawInfoSize
+                                              options:MTLResourceStorageModePrivate];
+            id<MTLBuffer> drawParamsBuffer =
+                [m_Context.device newBufferWithLength:drawParamsSize
+                                              options:MTLResourceStorageModePrivate];
+            id<MTLBuffer> paramsBuffer =
+                [m_Context.device newBufferWithLength:sizeof(GeometryIndexedIndirectCountParams)
+                                              options:MTLResourceStorageModeShared];
+            id<MTLBuffer> icbArgumentBuffer =
+                [m_Context.device newBufferWithLength:fillState.icbEncoder.encodedLength
+                                              options:MTLResourceStorageModeShared];
+            if (!icb || !executionRange || !drawInfoBuffer || !drawParamsBuffer || !paramsBuffer || !icbArgumentBuffer)
+            {
+                m_Context.error("[metal3] failed to allocate geometry-emulation counted indexed indirect ICB resources");
+                return;
+            }
+
+            // Metal exposes the ICB to a compute shader through an argument
+            // buffer. The helper writes render_command entries into this ICB.
+            [fillState.icbEncoder setArgumentBuffer:icbArgumentBuffer offset:0];
+            [fillState.icbEncoder setIndirectCommandBuffer:icb atIndex:0];
+
+            // CPU-written constants tell the helper where to read the GPU count
+            // and args, how to interpret the current index buffer, and whether
+            // optional reflected argument tables must be encoded into each command.
+            auto* params = reinterpret_cast<GeometryIndexedIndirectCountParams*>([paramsBuffer contents]);
+            params->maxDrawCount = maxDrawCount;
+            params->paramOffsetBytes = paramOffsetBytes;
+            params->countOffsetBytes = countOffsetBytes;
+            params->primitiveType = uint32_t(convertRuntimePrimitiveType(pipeline->desc.primType));
+            params->gsVertexSizeInBytes = pipeline->geometryVertexSizeInBytes;
+            params->gsMaxInputPrimitivesPerMeshThreadgroup =
+                pipeline->geometryMaxInputPrimitivesPerMeshThreadgroup;
+            params->indexType = uint32_t(convertIndexFormat(m_CurrentGraphicsState.indexBuffer.format));
+            params->indexBufferOffsetInElements =
+                uint32_t(m_CurrentGraphicsState.indexBuffer.offset / indexSize);
+            params->indexBufferAddress = indexBuffer->getGpuVirtualAddress();
+            params->hasObjectArgumentTable = objectArgumentTable ? 1u : 0u;
+            params->hasMeshArgumentTable = meshArgumentTable ? 1u : 0u;
+            params->hasFragmentArgumentTable = fragmentArgumentTable ? 1u : 0u;
+
+            m_ReferencedNativeResources.push_back(icb);
+            m_ReferencedNativeResources.push_back(executionRange);
+            m_ReferencedNativeBuffers.push_back(drawInfoBuffer);
+            m_ReferencedNativeBuffers.push_back(drawParamsBuffer);
+            m_ReferencedNativeBuffers.push_back(paramsBuffer);
+            m_ReferencedNativeBuffers.push_back(icbArgumentBuffer);
+            m_ReferencedNativeBuffers.push_back(vertexBufferTable);
+            if (objectArgumentTable)
+                m_ReferencedNativeBuffers.push_back(objectArgumentTable);
+            if (meshArgumentTable)
+                m_ReferencedNativeBuffers.push_back(meshArgumentTable);
+            if (fragmentArgumentTable)
+                m_ReferencedNativeBuffers.push_back(fragmentArgumentTable);
+
+            endEncoding();
+
+            // Reset the full possible command range; the compute pass only writes
+            // commands below min(gpuCount, maxDrawCount), and executeCommands uses
+            // the GPU-written range to skip the rest.
+            id<MTLBlitCommandEncoder> blit = [trackedCmdBuffer blitCommandEncoder];
+            [blit resetCommandsInBuffer:icb withRange:NSMakeRange(0, maxDrawCount)];
+            [blit endEncoding];
+
+            // Fill the per-draw IRRuntime records and ICB commands on GPU. This is
+            // the counted part of the path: the shader reads indirectCount and no
+            // CPU-side loop or readback is needed.
+            id<MTLComputeCommandEncoder> compute = [trackedCmdBuffer computeCommandEncoder];
+            if (!compute)
+            {
+                m_Context.error("[metal3] failed to create compute encoder for geometry counted indexed indirect ICB fill");
+                return;
+            }
+            [compute setComputePipelineState:fillState.pipeline];
+            [compute setBuffer:indirectParams->buffer offset:0 atIndex:0];
+            [compute setBuffer:indirectCount->buffer offset:0 atIndex:1];
+            [compute setBuffer:executionRange offset:0 atIndex:2];
+            [compute setBuffer:icbArgumentBuffer offset:0 atIndex:3];
+            [compute setBuffer:drawInfoBuffer offset:0 atIndex:4];
+            [compute setBuffer:drawParamsBuffer offset:0 atIndex:5];
+            [compute setBuffer:paramsBuffer offset:0 atIndex:6];
+            [compute setBuffer:vertexBufferTable offset:vertexBufferTableOffset atIndex:7];
+            [compute setBuffer:(objectArgumentTable ? objectArgumentTable : paramsBuffer) offset:0 atIndex:8];
+            [compute setBuffer:(meshArgumentTable ? meshArgumentTable : paramsBuffer) offset:0 atIndex:9];
+            [compute setBuffer:(fragmentArgumentTable ? fragmentArgumentTable : paramsBuffer) offset:0 atIndex:10];
+            [compute useResource:indirectParams->buffer usage:MTLResourceUsageRead];
+            [compute useResource:indirectCount->buffer usage:MTLResourceUsageRead];
+            [compute useResource:indexBuffer->buffer usage:MTLResourceUsageRead];
+            [compute useResource:executionRange usage:MTLResourceUsageWrite];
+            [compute useResource:drawInfoBuffer usage:MTLResourceUsageWrite];
+            [compute useResource:drawParamsBuffer usage:MTLResourceUsageWrite];
+            [compute useResource:icbArgumentBuffer usage:MTLResourceUsageRead];
+            [compute useResource:vertexBufferTable usage:MTLResourceUsageRead];
+            if (objectArgumentTable)
+                [compute useResource:objectArgumentTable usage:MTLResourceUsageRead];
+            if (meshArgumentTable)
+                [compute useResource:meshArgumentTable usage:MTLResourceUsageRead];
+            if (fragmentArgumentTable)
+                [compute useResource:fragmentArgumentTable usage:MTLResourceUsageRead];
+            [compute useResource:icb usage:MTLResourceUsageWrite];
+
+            const NSUInteger threads = std::max<NSUInteger>(1, fillState.pipeline.threadExecutionWidth);
+            const NSUInteger groups = (NSUInteger(maxDrawCount) + threads - 1) / threads;
+            [compute dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+            [compute endEncoding];
+
+            id<MTLRenderCommandEncoder> renderEncoder = getOrCreateRenderEncoder();
+            if (!renderEncoder)
+                return;
+
+            applyGraphicsStateToEncoder(renderEncoder, m_CurrentGraphicsState);
+            if (!m_GeometryEmulationDrawStateValid)
+            {
+                if (traceMetalRuntime())
+                    m_Context.warning("[metal3-trace] drawIndexedIndirectCount skipped: geometry-emulation state restore failed");
+                return;
+            }
+
+            // The ICB inherits only pipeline state. Its commands contain buffer
+            // bindings, but explicit resource usage keeps Metal validation and
+            // hazard tracking aware of everything those commands can read.
+            [renderEncoder useResource:icb
+                                  usage:MTLResourceUsageRead
+                                 stages:MTLRenderStageObject | MTLRenderStageMesh];
+            [renderEncoder useResource:executionRange
+                                  usage:MTLResourceUsageRead
+                                 stages:MTLRenderStageObject | MTLRenderStageMesh];
+            [renderEncoder useResource:indexBuffer->buffer
+                                  usage:MTLResourceUsageRead
+                                 stages:MTLRenderStageObject | MTLRenderStageMesh];
+            [renderEncoder useResource:drawInfoBuffer
+                                  usage:MTLResourceUsageRead
+                                 stages:MTLRenderStageObject | MTLRenderStageMesh];
+            [renderEncoder useResource:drawParamsBuffer
+                                  usage:MTLResourceUsageRead
+                                 stages:MTLRenderStageObject | MTLRenderStageMesh];
+            [renderEncoder useResource:vertexBufferTable
+                                  usage:MTLResourceUsageRead
+                                 stages:MTLRenderStageObject];
+            if (objectArgumentTable)
+                [renderEncoder useResource:objectArgumentTable
+                                      usage:MTLResourceUsageRead
+                                     stages:MTLRenderStageObject];
+            if (meshArgumentTable)
+                [renderEncoder useResource:meshArgumentTable
+                                      usage:MTLResourceUsageRead
+                                     stages:MTLRenderStageMesh];
+            if (fragmentArgumentTable)
+                [renderEncoder useResource:fragmentArgumentTable
+                                      usage:MTLResourceUsageRead
+                                     stages:MTLRenderStageFragment];
+
+            // Execute only commands 0..gpuCount-1, where gpuCount was clamped by
+            // the compute helper and written into executionRange on the GPU.
+            [renderEncoder executeCommandsInBuffer:icb
+                                    indirectBuffer:executionRange
+                              indirectBufferOffset:0];
+        }
+        else if (traceMetalRuntime())
+        {
+            m_Context.warning("[metal3-trace] geometry-emulation drawIndexedIndirectCount requires macOS 14 mesh ICB support");
+        }
+    }
+
     void CommandList::setComputeState(const ComputeState& state)
     {
         m_CurrentComputeState = state;
@@ -2235,6 +2895,8 @@ namespace nvrhi::metal3
             return;
 
         m_GeometryEmulationDrawStateValid = false;
+        m_GeometryEmulationVertexBuffers = nil;
+        m_GeometryEmulationVertexBuffersOffset = 0;
 
         [encoder setRenderPipelineState:pipeline->pipeline];
         [encoder setDepthStencilState:pipeline->depthStencilState];
@@ -2600,6 +3262,8 @@ namespace nvrhi::metal3
 
         std::memcpy(allocation.cpuAddress, vertexBuffers, sizeof(IRRuntimeVertexBuffers));
         m_ReferencedNativeBuffers.push_back(allocation.buffer);
+        m_GeometryEmulationVertexBuffers = allocation.buffer;
+        m_GeometryEmulationVertexBuffersOffset = allocation.offset;
         [encoder setObjectBuffer:allocation.buffer offset:allocation.offset atIndex:0];
         [encoder useResource:allocation.buffer usage:MTLResourceUsageRead stages:MTLRenderStageObject];
         return true;
