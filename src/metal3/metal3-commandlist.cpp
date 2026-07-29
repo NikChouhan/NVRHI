@@ -1408,6 +1408,10 @@ namespace nvrhi::metal3
     // crates a new command buffer, invalidates compute and graphics state, and the encoders
     void CommandList::open()
     {
+        m_ReferencedBindingSets.clear();
+        m_ReferencedNativeBuffers.clear();
+        m_ReferencedNativeResources.clear();
+        m_ArgumentTableCache.clear();
         m_UploadManager.beginCommandBuffer();
         m_VolatileBufferAllocations.clear();
         trackedCmdBuffer = [m_Context.commonQueue commandBuffer];
