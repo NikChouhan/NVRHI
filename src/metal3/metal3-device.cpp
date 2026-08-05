@@ -400,6 +400,8 @@ namespace nvrhi::metal3
             return MTLPixelFormatBC5_RGSnorm;
         case Format::D32:
             return MTLPixelFormatDepth32Float;
+        case Format::D16:
+            return MTLPixelFormatDepth16Unorm;
         case Format::D24S8:
             return MTLPixelFormatDepth24Unorm_Stencil8;
         case Format::D32S8:
