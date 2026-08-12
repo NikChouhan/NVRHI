@@ -42,6 +42,7 @@ cmake_dependent_option(NVRHI_WITH_NVAPI "Include NVAPI support (requires NVAPI S
 cmake_dependent_option(NVRHI_WITH_DX11 "Build the NVRHI D3D11 backend" ON "WIN32" OFF)
 cmake_dependent_option(NVRHI_WITH_DX12 "Build the NVRHI D3D12 backend" ON "WIN32" OFF)
 cmake_dependent_option(NVRHI_WITH_METAL3 "Build the NVRHI Metal 3 backend" ON "APPLE" OFF)
+cmake_dependent_option(NVRHI_METAL3_WITH_TRACY "Enable Tracy GPU timestamp instrumentation in the Metal 3 backend" OFF "NVRHI_WITH_METAL3" OFF)
 
 
 if(NVRHI_WITH_VULKAN)
@@ -507,6 +508,14 @@ if (NVRHI_WITH_METAL3)
             ${NVRHI_METAL_FRAMEWORK}
             ${NVRHI_FOUNDATION_FRAMEWORK}
             ${NVRHI_QUARTZCORE_FRAMEWORK})
+
+    if (NVRHI_METAL3_WITH_TRACY)
+        if (NOT TARGET Tracy::TracyClient)
+            message(FATAL_ERROR "NVRHI_METAL3_WITH_TRACY requires the Tracy::TracyClient target")
+        endif()
+        target_link_libraries(${nvrhi_metal3_target} PRIVATE Tracy::TracyClient)
+        target_compile_definitions(${nvrhi_metal3_target} PRIVATE NVRHI_METAL3_WITH_TRACY=1)
+    endif()
 endif()
 
 
