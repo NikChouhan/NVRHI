@@ -901,7 +901,11 @@ namespace nvrhi::metal3
     {
         static bool enabled = [] {
             const char* value = std::getenv("LDV_METAL3_TRACE");
+#if defined(NDEBUG)
+            return value && std::string(value) != "0";
+#else
             return !value || std::string(value) != "0";
+#endif
         }();
         return enabled;
     }
