@@ -15,6 +15,8 @@
 #include <unordered_map>
 #include <vector>
 
+struct IRDescriptorTableEntry;
+
 #if defined(NVRHI_METAL3_WITH_TRACY) && defined(TRACY_ENABLE)
 #include <tracy/TracyMetal.hmm>
 #endif
@@ -88,6 +90,7 @@ namespace nvrhi::metal3
     struct MetalStageBindingPlan
     {
         ShaderType stage = ShaderType::None;
+        std::string debugName;
         bool valid = false;
         uint32_t resourceCount = 0;
         std::vector<MetalBindingPlanEntry> entries;
@@ -149,6 +152,12 @@ namespace nvrhi::metal3
         id<MTLBuffer> buffer = nil;
         NSUInteger offset = 0;
         void* cpuAddress = nullptr;
+    };
+
+    struct VolatileBufferAllocation
+    {
+        UploadAllocation allocation;
+        size_t writtenSize = 0;
     };
 
     // metal resource cache per nvrhi binding item
@@ -573,7 +582,7 @@ namespace nvrhi::metal3
 
         std::array<uint8_t, c_MaxPushConstantSize> m_PushConstants{};
         size_t m_PushConstantSize = 0;
-        std::unordered_map<Buffer*, UploadAllocation> m_VolatileBufferAllocations;
+        std::unordered_map<Buffer*, VolatileBufferAllocation> m_VolatileBufferAllocations;
 
         TracyGpuScopeDesc m_TracyGpuScope;
 #if defined(NVRHI_METAL3_WITH_TRACY) && defined(TRACY_ENABLE)
@@ -585,10 +594,13 @@ namespace nvrhi::metal3
         id<MTLRenderCommandEncoder> getOrCreateRenderEncoder();
         id<MTLComputeCommandEncoder> getOrCreateComputeEncoder();
         id<MTLBuffer> getOrCreateArgumentTable(const MetalStageBindingPlan& plan, const BindingSetVector& bindingSets);
+        id<MTLBuffer> createArgumentTable(const MetalStageBindingPlan& plan, const BindingSetVector& bindingSets);
         void bindGraphicsArgumentTable(id<MTLRenderCommandEncoder> encoder, const BindingSetVector& bindingSets, const MetalStageBindingPlan& plan, MTLRenderStages stages);
-        bool bindVolatileConstantBuffer(id<MTLRenderCommandEncoder> encoder, const MetalBindingResource& resource, uint32_t slot, MTLRenderStages stages);
-        bool bindVolatileConstantBuffer(id<MTLComputeCommandEncoder> encoder, const BindingSetItem& item);
-        void bindVolatileConstantBuffersForStage(id<MTLRenderCommandEncoder> encoder, const BindingSetVector& bindingSets, const MetalStageBindingPlan& plan, MTLRenderStages stages);
+        bool encodeArgumentTableEntry(IRDescriptorTableEntry* entry, const MetalBindingResource& resource);
+        void useArgumentTableResource(id<MTLComputeCommandEncoder> encoder, const MetalBindingResource& resource);
+        void useArgumentTableResource(id<MTLRenderCommandEncoder> encoder, const MetalBindingResource& resource, MTLRenderStages stages);
+        void useArgumentTableResources(id<MTLComputeCommandEncoder> encoder, const BindingSetVector& bindingSets, const MetalStageBindingPlan& plan);
+        void useArgumentTableResources(id<MTLRenderCommandEncoder> encoder, const BindingSetVector& bindingSets, const MetalStageBindingPlan& plan, MTLRenderStages stages);
         bool bindGeometryEmulationVertexBuffers(id<MTLRenderCommandEncoder> encoder, const GraphicsPipeline& pipeline, const GraphicsState& state);
         void drawIndirectGeometryEmulation(uint32_t offsetBytes, uint32_t drawCount);
         void drawIndexedIndirectGeometryEmulation(uint32_t offsetBytes, uint32_t drawCount);
