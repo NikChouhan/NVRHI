@@ -17,6 +17,8 @@ namespace nvrhi::metal3
     static constexpr uint32_t c_MscVertexBufferBindPoint = 6;
     static constexpr uint32_t c_IrDrawArgumentsBindPoint = 4;
     static constexpr uint32_t c_IrRuntimeVertexBufferCount = 31;
+    static constexpr size_t c_ArgumentTablePageSize = 1024 * 1024;
+    static constexpr size_t c_ArgumentTableInitialPageCount = 3;
 
     struct IcbIndexedIndirectParams
     {
@@ -910,6 +912,15 @@ namespace nvrhi::metal3
         return enabled;
     }
 
+    static bool argumentTableStatsEnabled()
+    {
+        static bool enabled = [] {
+            const char* value = std::getenv("LDV_METAL3_ARGUMENT_TABLE_STATS");
+            return value && std::string(value) != "0";
+        }();
+        return enabled;
+    }
+
     static size_t alignUp(size_t value, size_t alignment)
     {
         if (alignment <= 1)
@@ -1205,15 +1216,35 @@ namespace nvrhi::metal3
         }
     }
 
-    // specify default chunk size a 4MB minimum
+    // Upload buffers retain their historical 4 MiB minimum by default. Callers
+    // may request a smaller dedicated page size for a different data class.
     // m_CompletedSerial tracks which submitted command buffers have finished on the GPU
-    UploadManager::UploadManager(const MTL3Context& context, size_t uploadChunkSize, size_t scratchMaxMem, bool isScratchBuffer)
+    UploadManager::UploadManager(const MTL3Context& context, size_t uploadChunkSize, size_t scratchMaxMem,
+        bool isScratchBuffer, size_t minimumChunkSize, size_t initialChunkCount)
         : m_Context(context)
-        , m_DefaultChunkSize(std::max<size_t>(uploadChunkSize, 4 * 1024 * 1024))
+        , m_DefaultChunkSize(std::max(uploadChunkSize, minimumChunkSize))
         , m_CompletedSerial(std::make_shared<std::atomic<uint64_t>>(0))
     {
         (void)scratchMaxMem;
         (void)isScratchBuffer;
+
+        m_Chunks.reserve(initialChunkCount);
+        for (size_t index = 0; index < initialChunkCount; ++index)
+        {
+            id<MTLBuffer> buffer = [m_Context.device newBufferWithLength:NSUInteger(m_DefaultChunkSize)
+                                                                  options:MTLResourceStorageModeShared];
+            if (!buffer)
+            {
+                m_Context.error("[nvrhi] Failed to allocate initial Metal upload chunk.");
+                break;
+            }
+
+            Chunk chunk;
+            chunk.buffer = buffer;
+            chunk.cpuAddress = static_cast<uint8_t*>([buffer contents]);
+            chunk.size = m_DefaultChunkSize;
+            m_Chunks.push_back(chunk);
+        }
     }
     // called, from cmdList.open, and every upload allocation made during this command (when cmdList open) list gets tagged with m_ActiveSerial
     void UploadManager::beginCommandBuffer()
@@ -1315,6 +1346,8 @@ namespace nvrhi::metal3
         : m_Context(context)
             , m_Device(device)
             , m_UploadManager(context, params.uploadChunkSize, 0, false)
+            , m_ArgumentTableManager(context, c_ArgumentTablePageSize, 0, false,
+                c_ArgumentTablePageSize, c_ArgumentTableInitialPageCount)
             , m_Desc(params) {}
         
     CommandList::~CommandList() {};
@@ -1427,6 +1460,9 @@ namespace nvrhi::metal3
         m_ReferencedNativeResources.clear();
         m_ArgumentTableCache.clear();
         m_UploadManager.beginCommandBuffer();
+        m_ArgumentTableManager.beginCommandBuffer();
+        m_ArgumentTableAllocationCount = 0;
+        m_ArgumentTablePageCountAtOpen = m_ArgumentTableManager.getChunkCount();
         m_VolatileBufferAllocations.clear();
         trackedCmdBuffer = [m_Context.commonQueue commandBuffer];
         m_CurrentGraphicsStateValid = false;
@@ -1442,6 +1478,15 @@ namespace nvrhi::metal3
     {
         endEncoding();
         m_UploadManager.submitCommandBuffer(trackedCmdBuffer);
+        m_ArgumentTableManager.submitCommandBuffer(trackedCmdBuffer);
+        if (argumentTableStatsEnabled())
+        {
+            const size_t pageCount = m_ArgumentTableManager.getChunkCount();
+            m_Context.info("[metal3] argument-table frame: tables=" +
+                std::to_string(m_ArgumentTableAllocationCount) +
+                " pages=" + std::to_string(pageCount) +
+                " new_pages=" + std::to_string(pageCount - m_ArgumentTablePageCountAtOpen));
+        }
         [trackedCmdBuffer commit];
     }
 
@@ -2638,15 +2683,15 @@ namespace nvrhi::metal3
             // when those commands are executed later by the render encoder.
             id<MTLBuffer> vertexBufferTable = m_GeometryEmulationVertexBuffers;
             const NSUInteger vertexBufferTableOffset = m_GeometryEmulationVertexBuffersOffset;
-            id<MTLBuffer> objectArgumentTable = getOrCreateArgumentTable(pipeline->objectBindingPlan, m_CurrentGraphicsState.bindings);
-            id<MTLBuffer> meshArgumentTable = getOrCreateArgumentTable(pipeline->meshBindingPlan, m_CurrentGraphicsState.bindings);
-            id<MTLBuffer> fragmentArgumentTable = pipeline->desc.PS
+            const ArgumentTableAllocation objectArgumentTable = getOrCreateArgumentTable(pipeline->objectBindingPlan, m_CurrentGraphicsState.bindings);
+            const ArgumentTableAllocation meshArgumentTable = getOrCreateArgumentTable(pipeline->meshBindingPlan, m_CurrentGraphicsState.bindings);
+            const ArgumentTableAllocation fragmentArgumentTable = pipeline->desc.PS
                 ? getOrCreateArgumentTable(pipeline->fragmentBindingPlan, m_CurrentGraphicsState.bindings)
-                : nil;
+                : ArgumentTableAllocation{};
             if (!vertexBufferTable ||
-                (pipeline->objectBindingPlan.resourceCount != 0 && !objectArgumentTable) ||
-                (pipeline->meshBindingPlan.resourceCount != 0 && !meshArgumentTable) ||
-                (pipeline->fragmentBindingPlan.resourceCount != 0 && !fragmentArgumentTable))
+                (pipeline->objectBindingPlan.resourceCount != 0 && !objectArgumentTable.buffer) ||
+                (pipeline->meshBindingPlan.resourceCount != 0 && !meshArgumentTable.buffer) ||
+                (pipeline->fragmentBindingPlan.resourceCount != 0 && !fragmentArgumentTable.buffer))
             {
                 m_Context.warning("[metal3] geometry-emulation counted indexed indirect draw skipped because reflected state tables are missing");
                 return;
@@ -2719,9 +2764,9 @@ namespace nvrhi::metal3
             params->indexBufferOffsetInElements =
                 uint32_t(m_CurrentGraphicsState.indexBuffer.offset / indexSize);
             params->indexBufferAddress = indexBuffer->getGpuVirtualAddress();
-            params->hasObjectArgumentTable = objectArgumentTable ? 1u : 0u;
-            params->hasMeshArgumentTable = meshArgumentTable ? 1u : 0u;
-            params->hasFragmentArgumentTable = fragmentArgumentTable ? 1u : 0u;
+            params->hasObjectArgumentTable = objectArgumentTable.buffer ? 1u : 0u;
+            params->hasMeshArgumentTable = meshArgumentTable.buffer ? 1u : 0u;
+            params->hasFragmentArgumentTable = fragmentArgumentTable.buffer ? 1u : 0u;
 
             m_ReferencedNativeResources.push_back(icb);
             m_ReferencedNativeResources.push_back(executionRange);
@@ -2730,12 +2775,12 @@ namespace nvrhi::metal3
             m_ReferencedNativeBuffers.push_back(paramsBuffer);
             m_ReferencedNativeBuffers.push_back(icbArgumentBuffer);
             m_ReferencedNativeBuffers.push_back(vertexBufferTable);
-            if (objectArgumentTable)
-                m_ReferencedNativeBuffers.push_back(objectArgumentTable);
-            if (meshArgumentTable)
-                m_ReferencedNativeBuffers.push_back(meshArgumentTable);
-            if (fragmentArgumentTable)
-                m_ReferencedNativeBuffers.push_back(fragmentArgumentTable);
+            if (objectArgumentTable.buffer)
+                m_ReferencedNativeBuffers.push_back(objectArgumentTable.buffer);
+            if (meshArgumentTable.buffer)
+                m_ReferencedNativeBuffers.push_back(meshArgumentTable.buffer);
+            if (fragmentArgumentTable.buffer)
+                m_ReferencedNativeBuffers.push_back(fragmentArgumentTable.buffer);
 
             endEncoding();
 
@@ -2764,9 +2809,12 @@ namespace nvrhi::metal3
             [compute setBuffer:drawParamsBuffer offset:0 atIndex:5];
             [compute setBuffer:paramsBuffer offset:0 atIndex:6];
             [compute setBuffer:vertexBufferTable offset:vertexBufferTableOffset atIndex:7];
-            [compute setBuffer:(objectArgumentTable ? objectArgumentTable : paramsBuffer) offset:0 atIndex:8];
-            [compute setBuffer:(meshArgumentTable ? meshArgumentTable : paramsBuffer) offset:0 atIndex:9];
-            [compute setBuffer:(fragmentArgumentTable ? fragmentArgumentTable : paramsBuffer) offset:0 atIndex:10];
+            [compute setBuffer:(objectArgumentTable.buffer ? objectArgumentTable.buffer : paramsBuffer)
+                        offset:(objectArgumentTable.buffer ? objectArgumentTable.offset : 0) atIndex:8];
+            [compute setBuffer:(meshArgumentTable.buffer ? meshArgumentTable.buffer : paramsBuffer)
+                        offset:(meshArgumentTable.buffer ? meshArgumentTable.offset : 0) atIndex:9];
+            [compute setBuffer:(fragmentArgumentTable.buffer ? fragmentArgumentTable.buffer : paramsBuffer)
+                        offset:(fragmentArgumentTable.buffer ? fragmentArgumentTable.offset : 0) atIndex:10];
             [compute useResource:indirectParams->buffer usage:MTLResourceUsageRead];
             [compute useResource:indirectCount->buffer usage:MTLResourceUsageRead];
             [compute useResource:indexBuffer->buffer usage:MTLResourceUsageRead];
@@ -2775,12 +2823,12 @@ namespace nvrhi::metal3
             [compute useResource:drawParamsBuffer usage:MTLResourceUsageWrite];
             [compute useResource:icbArgumentBuffer usage:MTLResourceUsageRead];
             [compute useResource:vertexBufferTable usage:MTLResourceUsageRead];
-            if (objectArgumentTable)
-                [compute useResource:objectArgumentTable usage:MTLResourceUsageRead];
-            if (meshArgumentTable)
-                [compute useResource:meshArgumentTable usage:MTLResourceUsageRead];
-            if (fragmentArgumentTable)
-                [compute useResource:fragmentArgumentTable usage:MTLResourceUsageRead];
+            if (objectArgumentTable.buffer)
+                [compute useResource:objectArgumentTable.buffer usage:MTLResourceUsageRead];
+            if (meshArgumentTable.buffer)
+                [compute useResource:meshArgumentTable.buffer usage:MTLResourceUsageRead];
+            if (fragmentArgumentTable.buffer)
+                [compute useResource:fragmentArgumentTable.buffer usage:MTLResourceUsageRead];
             [compute useResource:icb usage:MTLResourceUsageWrite];
 
             const NSUInteger threads = std::max<NSUInteger>(1, fillState.pipeline.threadExecutionWidth);
@@ -2822,16 +2870,16 @@ namespace nvrhi::metal3
             [renderEncoder useResource:vertexBufferTable
                                   usage:MTLResourceUsageRead
                                  stages:MTLRenderStageObject];
-            if (objectArgumentTable)
-                [renderEncoder useResource:objectArgumentTable
+            if (objectArgumentTable.buffer)
+                [renderEncoder useResource:objectArgumentTable.buffer
                                       usage:MTLResourceUsageRead
                                      stages:MTLRenderStageObject];
-            if (meshArgumentTable)
-                [renderEncoder useResource:meshArgumentTable
+            if (meshArgumentTable.buffer)
+                [renderEncoder useResource:meshArgumentTable.buffer
                                       usage:MTLResourceUsageRead
                                      stages:MTLRenderStageMesh];
-            if (fragmentArgumentTable)
-                [renderEncoder useResource:fragmentArgumentTable
+            if (fragmentArgumentTable.buffer)
+                [renderEncoder useResource:fragmentArgumentTable.buffer
                                       usage:MTLResourceUsageRead
                                      stages:MTLRenderStageFragment];
 
@@ -2865,12 +2913,12 @@ namespace nvrhi::metal3
         [encoder setComputePipelineState:pipeline->pipeline];
         applyComputeBindings(encoder, state);
 
-        id<MTLBuffer> argumentBuffer = getOrCreateArgumentTable(pipeline->computeBindingPlan, state.bindings);
-        if (argumentBuffer)
+        const ArgumentTableAllocation allocation = getOrCreateArgumentTable(pipeline->computeBindingPlan, state.bindings);
+        if (allocation.buffer)
         {
-            m_ReferencedNativeBuffers.push_back(argumentBuffer);
-            [encoder setBuffer:argumentBuffer offset:0 atIndex:kIRArgumentBufferBindPoint];
-            [encoder useResource:argumentBuffer usage:MTLResourceUsageRead];
+            m_ReferencedNativeBuffers.push_back(allocation.buffer);
+            [encoder setBuffer:allocation.buffer offset:allocation.offset atIndex:kIRArgumentBufferBindPoint];
+            [encoder useResource:allocation.buffer usage:MTLResourceUsageRead];
             useArgumentTableResources(encoder, state.bindings, pipeline->computeBindingPlan);
         }
         else if (traceMetalRuntime() && pipeline->computeBindingPlan.valid && pipeline->computeBindingPlan.resourceCount != 0)
@@ -2966,18 +3014,24 @@ namespace nvrhi::metal3
     // each HLSL resource occupies, and layoutIndex selects the matching NVRHI
     // binding set from the current graphics/compute state.
     */
-    id<MTLBuffer> CommandList::createArgumentTable(const MetalStageBindingPlan& plan, const BindingSetVector& bindingSets)
+    ArgumentTableAllocation CommandList::createArgumentTable(const MetalStageBindingPlan& plan, const BindingSetVector& bindingSets)
     {
+        ArgumentTableAllocation allocation;
         if (!plan.valid || plan.resourceCount == 0)
-            return nil; 
+            return allocation;
 
-        const NSUInteger bufferSize = sizeof(IRDescriptorTableEntry) * plan.resourceCount;
-        id<MTLBuffer> argumentBuffer = [m_Context.device newBufferWithLength:bufferSize options:MTLResourceStorageModeShared];
-        if (!argumentBuffer)
-            return nil;
+        const size_t tableSize = sizeof(IRDescriptorTableEntry) * size_t(plan.resourceCount);
+        UploadAllocation upload = m_ArgumentTableManager.suballocate(tableSize, 256);
+        if (!upload.buffer || !upload.cpuAddress)
+            return allocation;
 
-        auto* entries = static_cast<IRDescriptorTableEntry*>([argumentBuffer contents]);
-        std::memset(entries, 0, bufferSize);
+        allocation.buffer = upload.buffer;
+        allocation.offset = upload.offset;
+        allocation.cpuAddress = upload.cpuAddress;
+        ++m_ArgumentTableAllocationCount;
+
+        auto* entries = static_cast<IRDescriptorTableEntry*>(allocation.cpuAddress);
+        std::memset(entries, 0, tableSize);
 
         const bool traceArgumentTable = traceMetalRuntime();
         if (traceArgumentTable)
@@ -3080,11 +3134,12 @@ namespace nvrhi::metal3
             }
         }
 
-        return argumentBuffer;
+        return allocation;
     }
 
-    id<MTLBuffer> CommandList::getOrCreateArgumentTable(const MetalStageBindingPlan& plan, const BindingSetVector& bindingSets)
+    ArgumentTableAllocation CommandList::getOrCreateArgumentTable(const MetalStageBindingPlan& plan, const BindingSetVector& bindingSets)
     {
+        ArgumentTableAllocation allocation;
         if (!plan.valid || plan.resourceCount == 0)
         {
             if (!plan.valid && traceMetalRuntime())
@@ -3094,7 +3149,7 @@ namespace nvrhi::metal3
                     m_Context.warning("[metal3-trace] missing reflected binding plan for " +
                         std::string(utils::ShaderStageToString(plan.stage)) + "; regular shader resources are not directly bound");
             }
-            return nil;
+            return allocation;
         }
 
         if (planContainsVolatileConstantBuffer(plan))
@@ -3104,18 +3159,18 @@ namespace nvrhi::metal3
         for (const MetalArgumentTableCacheEntry& entry : m_ArgumentTableCache)
         {
             if (entry.key == key)
-                return entry.argumentBuffer;
+                return entry.allocation;
         }
 
-        id<MTLBuffer> argumentBuffer = createArgumentTable(plan, bindingSets);
-        if (!argumentBuffer)
-            return nil;
+        allocation = createArgumentTable(plan, bindingSets);
+        if (!allocation.buffer)
+            return allocation;
 
         MetalArgumentTableCacheEntry entry;
         entry.key = std::move(key);
-        entry.argumentBuffer = argumentBuffer;
+        entry.allocation = allocation;
         m_ArgumentTableCache.push_back(std::move(entry));
-        return argumentBuffer;
+        return allocation;
     }
 
     void CommandList::bindGraphicsArgumentTable(
@@ -3124,25 +3179,25 @@ namespace nvrhi::metal3
         const MetalStageBindingPlan& plan,
         MTLRenderStages stages)
     {
-        id<MTLBuffer> argumentBuffer = getOrCreateArgumentTable(plan, bindingSets);
-        if (!argumentBuffer)
+        const ArgumentTableAllocation allocation = getOrCreateArgumentTable(plan, bindingSets);
+        if (!allocation.buffer)
             return;
 
-        m_ReferencedNativeBuffers.push_back(argumentBuffer);
+        m_ReferencedNativeBuffers.push_back(allocation.buffer);
 
         if ((stages & MTLRenderStageVertex) != 0)
-            [encoder setVertexBuffer:argumentBuffer offset:0 atIndex:kIRArgumentBufferBindPoint];
+            [encoder setVertexBuffer:allocation.buffer offset:allocation.offset atIndex:kIRArgumentBufferBindPoint];
         if ((stages & MTLRenderStageFragment) != 0)
-            [encoder setFragmentBuffer:argumentBuffer offset:0 atIndex:kIRArgumentBufferBindPoint];
+            [encoder setFragmentBuffer:allocation.buffer offset:allocation.offset atIndex:kIRArgumentBufferBindPoint];
         if (@available(macOS 13.0, *))
         {
             if ((stages & MTLRenderStageObject) != 0)
-                [encoder setObjectBuffer:argumentBuffer offset:0 atIndex:kIRArgumentBufferBindPoint];
+                [encoder setObjectBuffer:allocation.buffer offset:allocation.offset atIndex:kIRArgumentBufferBindPoint];
             if ((stages & MTLRenderStageMesh) != 0)
-                [encoder setMeshBuffer:argumentBuffer offset:0 atIndex:kIRArgumentBufferBindPoint];
+                [encoder setMeshBuffer:allocation.buffer offset:allocation.offset atIndex:kIRArgumentBufferBindPoint];
         }
 
-        [encoder useResource:argumentBuffer usage:MTLResourceUsageRead stages:stages];
+        [encoder useResource:allocation.buffer usage:MTLResourceUsageRead stages:stages];
         useArgumentTableResources(encoder, bindingSets, plan, stages);
     }
 

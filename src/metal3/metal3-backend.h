@@ -110,10 +110,17 @@ namespace nvrhi::metal3
         }
     };
 
+    struct ArgumentTableAllocation
+    {
+        id<MTLBuffer> buffer = nil;
+        NSUInteger offset = 0;
+        void* cpuAddress = nullptr;
+    };
+
     struct MetalArgumentTableCacheEntry
     {
         MetalArgumentTableCacheKey key;
-        id<MTLBuffer> argumentBuffer = nil;
+        ArgumentTableAllocation allocation;
     };
 
     // implementation in metal3-constants.cpp
@@ -183,10 +190,13 @@ namespace nvrhi::metal3
     class UploadManager
     {
     public:
-        UploadManager(const MTL3Context& context, size_t uploadChunkSize, size_t scratchMaxMem, bool isScratchBuffer);
+        UploadManager(const MTL3Context& context, size_t uploadChunkSize, size_t scratchMaxMem,
+            bool isScratchBuffer, size_t minimumChunkSize = 4 * 1024 * 1024,
+            size_t initialChunkCount = 0);
         void beginCommandBuffer();
         void submitCommandBuffer(id<MTLCommandBuffer> commandBuffer);
         UploadAllocation suballocate(size_t size, size_t alignment);
+        size_t getChunkCount() const { return m_Chunks.size(); }
 
     private:
         struct Chunk
@@ -546,6 +556,9 @@ namespace nvrhi::metal3
         // would rather just have it inside m_Context like i have right now
         //Queue* m_Queue;
         UploadManager m_UploadManager;
+        // Argument tables must use stable memory until command-buffer
+        // completion, but must not create a native MTLBuffer per draw.
+        UploadManager m_ArgumentTableManager;
         
         CommandListParameters m_Desc;
 
@@ -579,6 +592,8 @@ namespace nvrhi::metal3
         std::vector<id<MTLResource>> m_ReferencedNativeResources;
 
         std::vector<MetalArgumentTableCacheEntry> m_ArgumentTableCache;
+        uint64_t m_ArgumentTableAllocationCount = 0;
+        size_t m_ArgumentTablePageCountAtOpen = 0;
 
         std::array<uint8_t, c_MaxPushConstantSize> m_PushConstants{};
         size_t m_PushConstantSize = 0;
@@ -593,8 +608,8 @@ namespace nvrhi::metal3
         void endEncoding();
         id<MTLRenderCommandEncoder> getOrCreateRenderEncoder();
         id<MTLComputeCommandEncoder> getOrCreateComputeEncoder();
-        id<MTLBuffer> getOrCreateArgumentTable(const MetalStageBindingPlan& plan, const BindingSetVector& bindingSets);
-        id<MTLBuffer> createArgumentTable(const MetalStageBindingPlan& plan, const BindingSetVector& bindingSets);
+        ArgumentTableAllocation getOrCreateArgumentTable(const MetalStageBindingPlan& plan, const BindingSetVector& bindingSets);
+        ArgumentTableAllocation createArgumentTable(const MetalStageBindingPlan& plan, const BindingSetVector& bindingSets);
         void bindGraphicsArgumentTable(id<MTLRenderCommandEncoder> encoder, const BindingSetVector& bindingSets, const MetalStageBindingPlan& plan, MTLRenderStages stages);
         bool encodeArgumentTableEntry(IRDescriptorTableEntry* entry, const MetalBindingResource& resource);
         void useArgumentTableResource(id<MTLComputeCommandEncoder> encoder, const MetalBindingResource& resource);
