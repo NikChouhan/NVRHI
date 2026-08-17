@@ -921,6 +921,15 @@ namespace nvrhi::metal3
         return enabled;
     }
 
+    static bool indirectResourceStatsEnabled()
+    {
+        static bool enabled = [] {
+            const char* value = std::getenv("LDV_METAL3_INDIRECT_RESOURCE_STATS");
+            return value && std::string(value) != "0";
+        }();
+        return enabled;
+    }
+
     static size_t alignUp(size_t value, size_t alignment)
     {
         if (alignment <= 1)
@@ -1342,12 +1351,238 @@ namespace nvrhi::metal3
         return allocation;
     }
 
+    bool TransientIndirectResourcePool::IndirectCommandBufferKey::operator==(const IndirectCommandBufferKey& other) const
+    {
+        return commandTypes == other.commandTypes &&
+            inheritPipelineState == other.inheritPipelineState &&
+            inheritBuffers == other.inheritBuffers &&
+            maxVertexBufferBindCount == other.maxVertexBufferBindCount &&
+            maxFragmentBufferBindCount == other.maxFragmentBufferBindCount &&
+            maxObjectBufferBindCount == other.maxObjectBufferBindCount &&
+            maxMeshBufferBindCount == other.maxMeshBufferBindCount;
+    }
+
+    TransientIndirectResourcePool::TransientIndirectResourcePool(const MTL3Context& context)
+        : m_Context(context)
+        , m_State(std::make_shared<State>())
+    {
+        // The renderer permits three frames in flight. Pages are created lazily
+        // in these slots only when an indirect path actually needs them.
+        // no one in their sane mind goes beyond 3; less than 3 is fine here
+        m_State->slots.resize(3);
+    }
+
+    void TransientIndirectResourcePool::beginCommandBuffer()
+    {
+        std::lock_guard<std::mutex> lock(m_State->mutex);
+        m_ActiveSlot = size_t(-1);
+        for (size_t index = 0; index < m_State->slots.size(); ++index)
+        {
+            if (!m_State->slots[index].inFlight)
+            {
+                m_ActiveSlot = index;
+                break;
+            }
+        }
+
+        if (m_ActiveSlot == size_t(-1))
+        {
+            // Never overwrite resources that an earlier command buffer may
+            // still use. An overflow slot is returned to the same free pool
+            // once its completion handler fires.
+            m_State->slots.emplace_back();
+            m_ActiveSlot = m_State->slots.size() - 1;
+            m_State->slots[m_ActiveSlot].isOverflow = true;
+        }
+
+        FrameSlot& slot = m_State->slots[m_ActiveSlot];
+        slot.inFlight = true;
+        slot.stats = {};
+        slot.stats.usedOverflowSlot = slot.isOverflow;
+        for (BufferPage& page : slot.sharedPages)
+            page.writeOffset = 0;
+        for (BufferPage& page : slot.privatePages)
+            page.writeOffset = 0;
+    }
+
+    void TransientIndirectResourcePool::submitCommandBuffer(id<MTLCommandBuffer> commandBuffer)
+    {
+        if (!commandBuffer || m_ActiveSlot == size_t(-1))
+            return;
+
+        const std::shared_ptr<State> state = m_State;
+        const size_t slotIndex = m_ActiveSlot;
+        [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer>) {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (slotIndex < state->slots.size())
+                state->slots[slotIndex].inFlight = false;
+        }];
+        m_ActiveSlot = size_t(-1);
+    }
+
+    TransientIndirectResourcePool::Stats TransientIndirectResourcePool::getActiveStats() const
+    {
+        if (m_ActiveSlot == size_t(-1))
+            return {};
+        Stats stats = m_State->slots[m_ActiveSlot].stats;
+        stats.sharedPageCount = m_State->slots[m_ActiveSlot].sharedPages.size();
+        stats.privatePageCount = m_State->slots[m_ActiveSlot].privatePages.size();
+        return stats;
+    }
+
+    TransientBufferAllocation TransientIndirectResourcePool::allocate(
+        NSUInteger size, NSUInteger alignment, MTLResourceOptions options,
+        std::vector<BufferPage> FrameSlot::*pages)
+    {
+        TransientBufferAllocation allocation;
+        if (size == 0 || m_ActiveSlot == size_t(-1))
+            return allocation;
+
+        FrameSlot& slot = m_State->slots[m_ActiveSlot];
+        std::vector<BufferPage>& pageList = slot.*pages;
+        const NSUInteger alignedSize = NSUInteger(alignUp(size, alignment));
+
+        for (BufferPage& page : pageList)
+        {
+            const NSUInteger offset = NSUInteger(alignUp(page.writeOffset, alignment));
+            if (offset <= page.capacity && alignedSize <= page.capacity - offset)
+            {
+                // This is only a slice reservation. No native Metal resource is
+                // created for normal indirect calls while an existing page fits.
+                allocation.buffer = page.buffer;
+                allocation.offset = offset;
+                allocation.size = size;
+                allocation.cpuAddress = page.cpuAddress ? page.cpuAddress + offset : nullptr;
+                page.writeOffset = offset + alignedSize;
+                slot.stats.bytesReserved += size;
+                return allocation;
+            }
+        }
+
+        // A page is created only after all existing pages in this completed
+        // frame slot are full. Oversized requests receive one reusable page.
+        constexpr NSUInteger kPageSize = 1024 * 1024;
+        const NSUInteger pageSize = std::max(kPageSize, alignedSize);
+        id<MTLBuffer> buffer = [m_Context.device newBufferWithLength:pageSize options:options];
+        if (!buffer)
+        {
+            m_Context.error("[metal3] failed to allocate transient indirect resource page");
+            return allocation;
+        }
+
+        BufferPage page;
+        page.buffer = buffer;
+        page.capacity = pageSize;
+        page.cpuAddress = options == MTLResourceStorageModeShared
+            ? static_cast<uint8_t*>([buffer contents]) : nullptr;
+        page.writeOffset = alignedSize;
+        pageList.push_back(page);
+
+        if (options == MTLResourceStorageModeShared)
+            ++slot.stats.sharedPagesCreated;
+        else
+            ++slot.stats.privatePagesCreated;
+        slot.stats.bytesReserved += size;
+
+        allocation.buffer = buffer;
+        allocation.size = size;
+        allocation.cpuAddress = page.cpuAddress;
+        return allocation;
+    }
+
+    // Shared pages use MTLResourceStorageModeShared and expose CPU memory. They hold data written by the CPU:
+    // -> "paramsBuffer" contents
+    // -> "icbArgumentBuffer" contents populated through MTLArgumentEncoder
+
+    TransientBufferAllocation TransientIndirectResourcePool::allocateShared(NSUInteger size, NSUInteger alignment)
+    {
+        return allocate(size, alignment, MTLResourceStorageModeShared, &FrameSlot::sharedPages);
+    }
+
+    /*
+    // Private pages use MTLResourceStorageModePrivate; CPU address is null. They hold GPU-only data:
+    // executionRange
+    // drawInfoBuffer
+    // drawParamsBuffer
+    // meshIndirectArgsBuffer
+    */
+    TransientBufferAllocation TransientIndirectResourcePool::allocatePrivate(NSUInteger size, NSUInteger alignment)
+    {
+        return allocate(size, alignment, MTLResourceStorageModePrivate, &FrameSlot::privatePages);
+    }
+
+    id<MTLIndirectCommandBuffer> TransientIndirectResourcePool::acquireIndirectCommandBuffer(
+        MTLIndirectCommandBufferDescriptor* descriptor, NSUInteger requiredCapacity, bool* wasCreated,
+        NSUInteger* capacityOut)
+    {
+        if (wasCreated)
+            *wasCreated = false;
+        if (capacityOut)
+            *capacityOut = 0;
+        if (!descriptor || requiredCapacity == 0 || m_ActiveSlot == size_t(-1))
+            return nil;
+
+        IndirectCommandBufferKey key;
+        key.commandTypes = descriptor.commandTypes;
+        key.inheritPipelineState = descriptor.inheritPipelineState;
+        key.inheritBuffers = descriptor.inheritBuffers;
+        key.maxVertexBufferBindCount = descriptor.maxVertexBufferBindCount;
+        key.maxFragmentBufferBindCount = descriptor.maxFragmentBufferBindCount;
+        key.maxObjectBufferBindCount = descriptor.maxObjectBufferBindCount;
+        key.maxMeshBufferBindCount = descriptor.maxMeshBufferBindCount;
+
+        FrameSlot& slot = m_State->slots[m_ActiveSlot];
+        for (const PooledIndirectCommandBuffer& pooled : slot.indirectCommandBuffers)
+        {
+            if (pooled.key == key && pooled.capacity >= requiredCapacity)
+            {
+                // Reusing this ICB is safe because the containing slot belongs
+                // exclusively to the currently-recording command buffer.
+                ++slot.stats.indirectCommandBuffersReused;
+                if (capacityOut)
+                    *capacityOut = pooled.capacity;
+                return pooled.commandBuffer;
+            }
+        }
+
+        NSUInteger capacity = 1;
+        while (capacity < requiredCapacity && capacity <= std::numeric_limits<NSUInteger>::max() / 2)
+            capacity <<= 1;
+        if (capacity < requiredCapacity)
+            capacity = requiredCapacity;
+
+        // ICBs cannot be suballocated by offset. Grow capacity geometrically
+        // and retain the complete object in this frame slot for later reuse.
+        id<MTLIndirectCommandBuffer> commandBuffer =
+            [m_Context.device newIndirectCommandBufferWithDescriptor:descriptor
+                                                     maxCommandCount:capacity
+                                                            options:MTLResourceStorageModePrivate];
+        if (!commandBuffer)
+        {
+            m_Context.error("[metal3] failed to allocate transient indirect command buffer");
+            return nil;
+        }
+
+        PooledIndirectCommandBuffer pooled;
+        pooled.key = key;
+        pooled.capacity = capacity;
+        pooled.commandBuffer = commandBuffer;
+        slot.indirectCommandBuffers.push_back(pooled);
+        ++slot.stats.indirectCommandBuffersCreated;
+        if (wasCreated)
+            *wasCreated = true;
+        if (capacityOut)
+            *capacityOut = capacity;
+        return commandBuffer;
+    }
+
     CommandList::CommandList(class Device* device, const MTL3Context& context, const CommandListParameters& params)
         : m_Context(context)
             , m_Device(device)
             , m_UploadManager(context, params.uploadChunkSize, 0, false)
             , m_ArgumentTableManager(context, c_ArgumentTablePageSize, 0, false,
                 c_ArgumentTablePageSize, c_ArgumentTableInitialPageCount)
+            , m_TransientIndirectResources(context)
             , m_Desc(params) {}
         
     CommandList::~CommandList() {};
@@ -1461,6 +1696,7 @@ namespace nvrhi::metal3
         m_ArgumentTableCache.clear();
         m_UploadManager.beginCommandBuffer();
         m_ArgumentTableManager.beginCommandBuffer();
+        m_TransientIndirectResources.beginCommandBuffer();
         m_ArgumentTableAllocationCount = 0;
         m_ArgumentTablePageCountAtOpen = m_ArgumentTableManager.getChunkCount();
         m_VolatileBufferAllocations.clear();
@@ -1479,6 +1715,20 @@ namespace nvrhi::metal3
         endEncoding();
         m_UploadManager.submitCommandBuffer(trackedCmdBuffer);
         m_ArgumentTableManager.submitCommandBuffer(trackedCmdBuffer);
+        if (indirectResourceStatsEnabled())
+        {
+            const TransientIndirectResourcePool::Stats stats = m_TransientIndirectResources.getActiveStats();
+            m_Context.info("[metal3] indirect resources: shared_pages=" +
+                std::to_string(stats.sharedPageCount) +
+                " private_pages=" + std::to_string(stats.privatePageCount) +
+                " shared_pages_created=" + std::to_string(stats.sharedPagesCreated) +
+                " private_pages_created=" + std::to_string(stats.privatePagesCreated) +
+                " bytes_reserved=" + std::to_string(stats.bytesReserved) +
+                " icbs_reused=" + std::to_string(stats.indirectCommandBuffersReused) +
+                " icbs_created=" + std::to_string(stats.indirectCommandBuffersCreated) +
+                " overflow_slot=" + std::to_string(stats.usedOverflowSlot ? 1 : 0));
+        }
+        m_TransientIndirectResources.submitCommandBuffer(trackedCmdBuffer);
         if (argumentTableStatsEnabled())
         {
             const size_t pageCount = m_ArgumentTableManager.getChunkCount();
@@ -2108,21 +2358,21 @@ namespace nvrhi::metal3
             // The helper compute pass expands each NVRHI DrawIndirectArguments
             // record into the three buffers consumed by IRRuntime GS emulation:
             // draw info, draw params, and Metal mesh indirect dispatch args.
-            id<MTLBuffer> drawInfoBuffer =
-                [m_Context.device newBufferWithLength:drawInfoSize options:MTLResourceStorageModePrivate];
-            id<MTLBuffer> drawParamsBuffer =
-                [m_Context.device newBufferWithLength:drawParamsSize options:MTLResourceStorageModePrivate];
-            id<MTLBuffer> meshIndirectArgsBuffer =
-                [m_Context.device newBufferWithLength:meshArgsSize options:MTLResourceStorageModePrivate];
-            id<MTLBuffer> paramsBuffer =
-                [m_Context.device newBufferWithLength:sizeof(GeometryIndirectParams) options:MTLResourceStorageModeShared];
-            if (!drawInfoBuffer || !drawParamsBuffer || !meshIndirectArgsBuffer || !paramsBuffer)
+            // These are distinct slices for this call. They share native pages
+            // with other calls only at non-overlapping offsets.
+            const TransientBufferAllocation drawInfoAllocation = m_TransientIndirectResources.allocatePrivate(drawInfoSize);
+            const TransientBufferAllocation drawParams = m_TransientIndirectResources.allocatePrivate(drawParamsSize);
+            const TransientBufferAllocation meshIndirectArgs = m_TransientIndirectResources.allocatePrivate(meshArgsSize);
+            const TransientBufferAllocation paramsAllocation =
+                m_TransientIndirectResources.allocateShared(sizeof(GeometryIndirectParams));
+            if (!drawInfoAllocation.buffer || !drawParams.buffer || !meshIndirectArgs.buffer ||
+                !paramsAllocation.buffer || !paramsAllocation.cpuAddress)
             {
                 m_Context.error("[metal3] failed to allocate geometry-emulation drawIndirect resources");
                 return;
             }
 
-            auto* params = static_cast<GeometryIndirectParams*>([paramsBuffer contents]);
+            auto* params = static_cast<GeometryIndirectParams*>(paramsAllocation.cpuAddress);
             // Non-indexed draws do not need index-buffer metadata; the helper
             // only reads vertexCount/instance/start values from indirectParams.
             params->drawCount = drawCount;
@@ -2136,10 +2386,10 @@ namespace nvrhi::metal3
             params->indexBufferOffsetInElements = 0;
             params->indexBufferAddress = 0;
 
-            m_ReferencedNativeBuffers.push_back(drawInfoBuffer);
-            m_ReferencedNativeBuffers.push_back(drawParamsBuffer);
-            m_ReferencedNativeBuffers.push_back(meshIndirectArgsBuffer);
-            m_ReferencedNativeBuffers.push_back(paramsBuffer);
+            m_ReferencedNativeBuffers.push_back(drawInfoAllocation.buffer);
+            m_ReferencedNativeBuffers.push_back(drawParams.buffer);
+            m_ReferencedNativeBuffers.push_back(meshIndirectArgs.buffer);
+            m_ReferencedNativeBuffers.push_back(paramsAllocation.buffer);
 
             // Leave the render pass, run the compute expansion, then restore the
             // geometry-emulation graphics state before issuing mesh indirect draws.
@@ -2147,14 +2397,14 @@ namespace nvrhi::metal3
             id<MTLComputeCommandEncoder> compute = [trackedCmdBuffer computeCommandEncoder];
             [compute setComputePipelineState:fillState.pipeline];
             [compute setBuffer:indirectParams->buffer offset:0 atIndex:0];
-            [compute setBuffer:drawInfoBuffer offset:0 atIndex:1];
-            [compute setBuffer:drawParamsBuffer offset:0 atIndex:2];
-            [compute setBuffer:meshIndirectArgsBuffer offset:0 atIndex:3];
-            [compute setBuffer:paramsBuffer offset:0 atIndex:4];
+            [compute setBuffer:drawInfoAllocation.buffer offset:drawInfoAllocation.offset atIndex:1];
+            [compute setBuffer:drawParams.buffer offset:drawParams.offset atIndex:2];
+            [compute setBuffer:meshIndirectArgs.buffer offset:meshIndirectArgs.offset atIndex:3];
+            [compute setBuffer:paramsAllocation.buffer offset:paramsAllocation.offset atIndex:4];
             [compute useResource:indirectParams->buffer usage:MTLResourceUsageRead];
-            [compute useResource:drawInfoBuffer usage:MTLResourceUsageWrite];
-            [compute useResource:drawParamsBuffer usage:MTLResourceUsageWrite];
-            [compute useResource:meshIndirectArgsBuffer usage:MTLResourceUsageWrite];
+            [compute useResource:drawInfoAllocation.buffer usage:MTLResourceUsageWrite];
+            [compute useResource:drawParams.buffer usage:MTLResourceUsageWrite];
+            [compute useResource:meshIndirectArgs.buffer usage:MTLResourceUsageWrite];
 
             const NSUInteger threads = std::max<NSUInteger>(1, fillState.pipeline.threadExecutionWidth);
             const NSUInteger groups = (NSUInteger(drawCount) + threads - 1) / threads;
@@ -2195,13 +2445,13 @@ namespace nvrhi::metal3
                 &objectThreadgroupSize,
                 &meshThreadgroupSize);
 
-            [renderEncoder useResource:drawInfoBuffer
+            [renderEncoder useResource:drawInfoAllocation.buffer
                                   usage:MTLResourceUsageRead
                                  stages:MTLRenderStageObject | MTLRenderStageMesh];
-            [renderEncoder useResource:drawParamsBuffer
+            [renderEncoder useResource:drawParams.buffer
                                   usage:MTLResourceUsageRead
                                  stages:MTLRenderStageObject | MTLRenderStageMesh];
-            [renderEncoder useResource:meshIndirectArgsBuffer
+            [renderEncoder useResource:meshIndirectArgs.buffer
                                   usage:MTLResourceUsageRead
                                  stages:MTLRenderStageObject | MTLRenderStageMesh];
 
@@ -2210,21 +2460,21 @@ namespace nvrhi::metal3
             // threadgroup dimensions.
             for (uint32_t drawIndex = 0; drawIndex < drawCount; ++drawIndex)
             {
-                [renderEncoder setObjectBuffer:drawInfoBuffer
-                                        offset:drawInfoStride * NSUInteger(drawIndex)
+                [renderEncoder setObjectBuffer:drawInfoAllocation.buffer
+                                        offset:drawInfoAllocation.offset + drawInfoStride * NSUInteger(drawIndex)
                                        atIndex:kIRArgumentBufferUniformsBindPoint];
-                [renderEncoder setMeshBuffer:drawInfoBuffer
-                                      offset:drawInfoStride * NSUInteger(drawIndex)
+                [renderEncoder setMeshBuffer:drawInfoAllocation.buffer
+                                      offset:drawInfoAllocation.offset + drawInfoStride * NSUInteger(drawIndex)
                                      atIndex:kIRArgumentBufferUniformsBindPoint];
-                [renderEncoder setObjectBuffer:drawParamsBuffer
-                                        offset:drawParamsStride * NSUInteger(drawIndex)
+                [renderEncoder setObjectBuffer:drawParams.buffer
+                                        offset:drawParams.offset + drawParamsStride * NSUInteger(drawIndex)
                                        atIndex:kIRArgumentBufferDrawArgumentsBindPoint];
-                [renderEncoder setMeshBuffer:drawParamsBuffer
-                                      offset:drawParamsStride * NSUInteger(drawIndex)
+                [renderEncoder setMeshBuffer:drawParams.buffer
+                                      offset:drawParams.offset + drawParamsStride * NSUInteger(drawIndex)
                                      atIndex:kIRArgumentBufferDrawArgumentsBindPoint];
 
-                [renderEncoder drawMeshThreadgroupsWithIndirectBuffer:meshIndirectArgsBuffer
-                                                 indirectBufferOffset:meshArgsStride * NSUInteger(drawIndex)
+                [renderEncoder drawMeshThreadgroupsWithIndirectBuffer:meshIndirectArgs.buffer
+                                                 indirectBufferOffset:meshIndirectArgs.offset + meshArgsStride * NSUInteger(drawIndex)
                                           threadsPerObjectThreadgroup:MTLSizeMake(objectThreadgroupSize, 1, 1)
                                             threadsPerMeshThreadgroup:MTLSizeMake(meshThreadgroupSize, 1, 1)];
             }
@@ -2340,21 +2590,21 @@ namespace nvrhi::metal3
 
             // Indexed geometry emulation uses the same helper expansion as
             // drawIndirect, plus index-buffer metadata for mesh-stage index fetch.
-            id<MTLBuffer> drawInfoBuffer =
-                [m_Context.device newBufferWithLength:drawInfoSize options:MTLResourceStorageModePrivate];
-            id<MTLBuffer> drawParamsBuffer =
-                [m_Context.device newBufferWithLength:drawParamsSize options:MTLResourceStorageModePrivate];
-            id<MTLBuffer> meshIndirectArgsBuffer =
-                [m_Context.device newBufferWithLength:meshArgsSize options:MTLResourceStorageModePrivate];
-            id<MTLBuffer> paramsBuffer =
-                [m_Context.device newBufferWithLength:sizeof(GeometryIndirectParams) options:MTLResourceStorageModeShared];
-            if (!drawInfoBuffer || !drawParamsBuffer || !meshIndirectArgsBuffer || !paramsBuffer)
+            // These are distinct slices for this call. They share native pages
+            // with other calls only at non-overlapping offsets.
+            const TransientBufferAllocation drawInfoAllocation = m_TransientIndirectResources.allocatePrivate(drawInfoSize);
+            const TransientBufferAllocation drawParams = m_TransientIndirectResources.allocatePrivate(drawParamsSize);
+            const TransientBufferAllocation meshIndirectArgs = m_TransientIndirectResources.allocatePrivate(meshArgsSize);
+            const TransientBufferAllocation paramsAllocation =
+                m_TransientIndirectResources.allocateShared(sizeof(GeometryIndirectParams));
+            if (!drawInfoAllocation.buffer || !drawParams.buffer || !meshIndirectArgs.buffer ||
+                !paramsAllocation.buffer || !paramsAllocation.cpuAddress)
             {
                 m_Context.error("[metal3] failed to allocate geometry-emulation drawIndexedIndirect resources");
                 return;
             }
 
-            auto* params = static_cast<GeometryIndirectParams*>([paramsBuffer contents]);
+            auto* params = static_cast<GeometryIndirectParams*>(paramsAllocation.cpuAddress);
             // The helper reads DrawIndexedIndirectArguments from indirectParams
             // and patches startIndex with the bound NVRHI index-buffer offset.
             params->drawCount = drawCount;
@@ -2369,10 +2619,10 @@ namespace nvrhi::metal3
                 uint32_t(m_CurrentGraphicsState.indexBuffer.offset / indexSize);
             params->indexBufferAddress = indexBuffer->getGpuVirtualAddress();
 
-            m_ReferencedNativeBuffers.push_back(drawInfoBuffer);
-            m_ReferencedNativeBuffers.push_back(drawParamsBuffer);
-            m_ReferencedNativeBuffers.push_back(meshIndirectArgsBuffer);
-            m_ReferencedNativeBuffers.push_back(paramsBuffer);
+            m_ReferencedNativeBuffers.push_back(drawInfoAllocation.buffer);
+            m_ReferencedNativeBuffers.push_back(drawParams.buffer);
+            m_ReferencedNativeBuffers.push_back(meshIndirectArgs.buffer);
+            m_ReferencedNativeBuffers.push_back(paramsAllocation.buffer);
 
             // Generate IRRuntime per-draw records and mesh indirect args on the
             // GPU, because the original indexed indirect args are GPU-owned.
@@ -2380,14 +2630,14 @@ namespace nvrhi::metal3
             id<MTLComputeCommandEncoder> compute = [trackedCmdBuffer computeCommandEncoder];
             [compute setComputePipelineState:fillState.pipeline];
             [compute setBuffer:indirectParams->buffer offset:0 atIndex:0];
-            [compute setBuffer:drawInfoBuffer offset:0 atIndex:1];
-            [compute setBuffer:drawParamsBuffer offset:0 atIndex:2];
-            [compute setBuffer:meshIndirectArgsBuffer offset:0 atIndex:3];
-            [compute setBuffer:paramsBuffer offset:0 atIndex:4];
+            [compute setBuffer:drawInfoAllocation.buffer offset:drawInfoAllocation.offset atIndex:1];
+            [compute setBuffer:drawParams.buffer offset:drawParams.offset atIndex:2];
+            [compute setBuffer:meshIndirectArgs.buffer offset:meshIndirectArgs.offset atIndex:3];
+            [compute setBuffer:paramsAllocation.buffer offset:paramsAllocation.offset atIndex:4];
             [compute useResource:indirectParams->buffer usage:MTLResourceUsageRead];
-            [compute useResource:drawInfoBuffer usage:MTLResourceUsageWrite];
-            [compute useResource:drawParamsBuffer usage:MTLResourceUsageWrite];
-            [compute useResource:meshIndirectArgsBuffer usage:MTLResourceUsageWrite];
+            [compute useResource:drawInfoAllocation.buffer usage:MTLResourceUsageWrite];
+            [compute useResource:drawParams.buffer usage:MTLResourceUsageWrite];
+            [compute useResource:meshIndirectArgs.buffer usage:MTLResourceUsageWrite];
 
             const NSUInteger threads = std::max<NSUInteger>(1, fillState.pipeline.threadExecutionWidth);
             const NSUInteger groups = (NSUInteger(drawCount) + threads - 1) / threads;
@@ -2430,13 +2680,13 @@ namespace nvrhi::metal3
             [renderEncoder useResource:indexBuffer->buffer
                                   usage:MTLResourceUsageRead
                                  stages:MTLRenderStageObject | MTLRenderStageMesh];
-            [renderEncoder useResource:drawInfoBuffer
+            [renderEncoder useResource:drawInfoAllocation.buffer
                                   usage:MTLResourceUsageRead
                                  stages:MTLRenderStageObject | MTLRenderStageMesh];
-            [renderEncoder useResource:drawParamsBuffer
+            [renderEncoder useResource:drawParams.buffer
                                   usage:MTLResourceUsageRead
                                  stages:MTLRenderStageObject | MTLRenderStageMesh];
-            [renderEncoder useResource:meshIndirectArgsBuffer
+            [renderEncoder useResource:meshIndirectArgs.buffer
                                   usage:MTLResourceUsageRead
                                  stages:MTLRenderStageObject | MTLRenderStageMesh];
 
@@ -2445,21 +2695,21 @@ namespace nvrhi::metal3
             // current indirect draw entry.
             for (uint32_t drawIndex = 0; drawIndex < drawCount; ++drawIndex)
             {
-                [renderEncoder setObjectBuffer:drawInfoBuffer
-                                        offset:drawInfoStride * NSUInteger(drawIndex)
+                [renderEncoder setObjectBuffer:drawInfoAllocation.buffer
+                                        offset:drawInfoAllocation.offset + drawInfoStride * NSUInteger(drawIndex)
                                        atIndex:kIRArgumentBufferUniformsBindPoint];
-                [renderEncoder setMeshBuffer:drawInfoBuffer
-                                      offset:drawInfoStride * NSUInteger(drawIndex)
+                [renderEncoder setMeshBuffer:drawInfoAllocation.buffer
+                                      offset:drawInfoAllocation.offset + drawInfoStride * NSUInteger(drawIndex)
                                      atIndex:kIRArgumentBufferUniformsBindPoint];
-                [renderEncoder setObjectBuffer:drawParamsBuffer
-                                        offset:drawParamsStride * NSUInteger(drawIndex)
+                [renderEncoder setObjectBuffer:drawParams.buffer
+                                        offset:drawParams.offset + drawParamsStride * NSUInteger(drawIndex)
                                        atIndex:kIRArgumentBufferDrawArgumentsBindPoint];
-                [renderEncoder setMeshBuffer:drawParamsBuffer
-                                      offset:drawParamsStride * NSUInteger(drawIndex)
+                [renderEncoder setMeshBuffer:drawParams.buffer
+                                      offset:drawParams.offset + drawParamsStride * NSUInteger(drawIndex)
                                      atIndex:kIRArgumentBufferDrawArgumentsBindPoint];
 
-                [renderEncoder drawMeshThreadgroupsWithIndirectBuffer:meshIndirectArgsBuffer
-                                                 indirectBufferOffset:meshArgsStride * NSUInteger(drawIndex)
+                [renderEncoder drawMeshThreadgroupsWithIndirectBuffer:meshIndirectArgs.buffer
+                                                 indirectBufferOffset:meshIndirectArgs.offset + meshArgsStride * NSUInteger(drawIndex)
                                           threadsPerObjectThreadgroup:MTLSizeMake(objectThreadgroupSize, 1, 1)
                                             threadsPerMeshThreadgroup:MTLSizeMake(meshThreadgroupSize, 1, 1)];
             }
@@ -2523,20 +2773,19 @@ namespace nvrhi::metal3
         icbDesc.maxVertexBufferBindCount = std::max<NSUInteger>(c_IrDrawArgumentsBindPoint + 1, c_MscVertexBufferBindPoint + 1);
         icbDesc.maxFragmentBufferBindCount = 0;
 
+        // The page slices have nonzero offsets; propagate those exact offsets
+        // through the encoder and execute calls below.
+        NSUInteger icbCapacity = 0;
         id<MTLIndirectCommandBuffer> icb =
-            [m_Context.device newIndirectCommandBufferWithDescriptor:icbDesc
-                                                     maxCommandCount:NSUInteger(maxDrawCount)
-                                                            options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> executionRange =
-            [m_Context.device newBufferWithLength:sizeof(MTLIndirectCommandBufferExecutionRange)
-                                          options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> paramsBuffer =
-            [m_Context.device newBufferWithLength:sizeof(IcbIndexedIndirectParams)
-                                          options:MTLResourceStorageModeShared];
-        id<MTLBuffer> icbArgumentBuffer =
-            [m_Context.device newBufferWithLength:fillState.icbEncoder.encodedLength
-                                          options:MTLResourceStorageModeShared];
-        if (!icb || !executionRange || !paramsBuffer || !icbArgumentBuffer)
+            m_TransientIndirectResources.acquireIndirectCommandBuffer(icbDesc, NSUInteger(maxDrawCount), nullptr, &icbCapacity);
+        const TransientBufferAllocation executionRange =
+            m_TransientIndirectResources.allocatePrivate(sizeof(MTLIndirectCommandBufferExecutionRange));
+        const TransientBufferAllocation paramsAllocation =
+            m_TransientIndirectResources.allocateShared(sizeof(IcbIndexedIndirectParams));
+        const TransientBufferAllocation icbArgumentBuffer =
+            m_TransientIndirectResources.allocateShared(fillState.icbEncoder.encodedLength);
+        if (!icb || !executionRange.buffer || !paramsAllocation.buffer || !paramsAllocation.cpuAddress ||
+            !icbArgumentBuffer.buffer || !icbArgumentBuffer.cpuAddress)
         {
             m_Context.error("[metal3] failed to allocate counted indexed indirect ICB resources");
             return;
@@ -2545,14 +2794,14 @@ namespace nvrhi::metal3
         // Metal compute shaders receive an indirect command buffer through an
         // argument buffer. This encodes the ICB object into that argument buffer
         // so nvrhi_metal3_fill_indexed_indirect_icb can write render commands.
-        [fillState.icbEncoder setArgumentBuffer:icbArgumentBuffer offset:0];
+        [fillState.icbEncoder setArgumentBuffer:icbArgumentBuffer.buffer offset:icbArgumentBuffer.offset];
         [fillState.icbEncoder setIndirectCommandBuffer:icb atIndex:0];
 
         // Small CPU-written constant block consumed by the helper shader. It
         // describes where to read draw args/counts, how to interpret the index
         // buffer, and which MSC runtime vertex-buffer slot should receive each
         // draw's original D3D-style indirect argument record.
-        auto* params = reinterpret_cast<IcbIndexedIndirectParams*>([paramsBuffer contents]);
+        auto* params = reinterpret_cast<IcbIndexedIndirectParams*>(paramsAllocation.cpuAddress);
         params->maxDrawCount = maxDrawCount;
         params->paramOffsetBytes = paramOffsetBytes;
         params->countOffsetBytes = countOffsetBytes;
@@ -2562,14 +2811,14 @@ namespace nvrhi::metal3
         params->drawArgumentsBindPoint = c_IrDrawArgumentsBindPoint;
 
         m_ReferencedNativeResources.push_back(icb);
-        m_ReferencedNativeResources.push_back(executionRange);
-        m_ReferencedNativeBuffers.push_back(paramsBuffer);
-        m_ReferencedNativeBuffers.push_back(icbArgumentBuffer);
+        m_ReferencedNativeBuffers.push_back(executionRange.buffer);
+        m_ReferencedNativeBuffers.push_back(paramsAllocation.buffer);
+        m_ReferencedNativeBuffers.push_back(icbArgumentBuffer.buffer);
 
         // ICB memory is reused by Metal internally; reset the command range before
         // the compute pass selectively fills commands 0..min(gpuCount,maxDrawCount).
         id<MTLBlitCommandEncoder> blit = [trackedCmdBuffer blitCommandEncoder];
-        [blit resetCommandsInBuffer:icb withRange:NSMakeRange(0, maxDrawCount)];
+        [blit resetCommandsInBuffer:icb withRange:NSMakeRange(0, icbCapacity)];
         [blit endEncoding];
 
         // Fill the ICB on the GPU. Thread 0 writes the execution range from the
@@ -2579,14 +2828,14 @@ namespace nvrhi::metal3
         [compute setComputePipelineState:fillState.pipeline];
         [compute setBuffer:indirectParams->buffer offset:0 atIndex:0];
         [compute setBuffer:indirectCount->buffer offset:0 atIndex:1];
-        [compute setBuffer:executionRange offset:0 atIndex:2];
-        [compute setBuffer:icbArgumentBuffer offset:0 atIndex:3];
+        [compute setBuffer:executionRange.buffer offset:executionRange.offset atIndex:2];
+        [compute setBuffer:icbArgumentBuffer.buffer offset:icbArgumentBuffer.offset atIndex:3];
         [compute setBuffer:indexBuffer->buffer offset:0 atIndex:4];
-        [compute setBuffer:paramsBuffer offset:0 atIndex:5];
+        [compute setBuffer:paramsAllocation.buffer offset:paramsAllocation.offset atIndex:5];
         [compute useResource:indirectParams->buffer usage:MTLResourceUsageRead];
         [compute useResource:indirectCount->buffer usage:MTLResourceUsageRead];
         [compute useResource:indexBuffer->buffer usage:MTLResourceUsageRead];
-        [compute useResource:executionRange usage:MTLResourceUsageWrite];
+        [compute useResource:executionRange.buffer usage:MTLResourceUsageWrite];
         [compute useResource:icb usage:MTLResourceUsageWrite];
         const NSUInteger threads = std::max<NSUInteger>(1, fillState.pipeline.threadExecutionWidth);
         const NSUInteger groups = (NSUInteger(maxDrawCount) + threads - 1) / threads;
@@ -2599,12 +2848,13 @@ namespace nvrhi::metal3
         // encoder, restore the full graphics state before executeCommandsInBuffer.
         applyGraphicsStateToEncoder(renderEncoder, m_CurrentGraphicsState);
         [renderEncoder useResource:icb usage:MTLResourceUsageRead];
-        [renderEncoder useResource:executionRange usage:MTLResourceUsageRead];
+        [renderEncoder useResource:executionRange.buffer usage:MTLResourceUsageRead];
         [renderEncoder useResource:indirectParams->buffer usage:MTLResourceUsageRead];
         [renderEncoder useResource:indexBuffer->buffer usage:MTLResourceUsageRead];
         // Execute only the GPU-written range. This is what turns NVRHI's count
         // buffer into Metal's MTLIndirectCommandBufferExecutionRange.
-        [renderEncoder executeCommandsInBuffer:icb indirectBuffer:executionRange indirectBufferOffset:0];
+        [renderEncoder executeCommandsInBuffer:icb indirectBuffer:executionRange.buffer
+                          indirectBufferOffset:executionRange.offset];
     }
 
     void CommandList::drawIndexedIndirectCountGeometryEmulation(
@@ -2719,26 +2969,22 @@ namespace nvrhi::metal3
                     kIRArgumentBufferBindPoint + 1));
             icbDesc.maxFragmentBufferBindCount = kIRArgumentBufferBindPoint + 1;
 
+            // The ICB is whole-object pooled; the supporting buffers are page
+            // slices and therefore must keep their returned offsets.
+            NSUInteger icbCapacity = 0;
             id<MTLIndirectCommandBuffer> icb =
-                [m_Context.device newIndirectCommandBufferWithDescriptor:icbDesc
-                                                         maxCommandCount:NSUInteger(maxDrawCount)
-                                                                options:MTLResourceStorageModePrivate];
-            id<MTLBuffer> executionRange =
-                [m_Context.device newBufferWithLength:sizeof(MTLIndirectCommandBufferExecutionRange)
-                                              options:MTLResourceStorageModePrivate];
-            id<MTLBuffer> drawInfoBuffer =
-                [m_Context.device newBufferWithLength:drawInfoSize
-                                              options:MTLResourceStorageModePrivate];
-            id<MTLBuffer> drawParamsBuffer =
-                [m_Context.device newBufferWithLength:drawParamsSize
-                                              options:MTLResourceStorageModePrivate];
-            id<MTLBuffer> paramsBuffer =
-                [m_Context.device newBufferWithLength:sizeof(GeometryIndexedIndirectCountParams)
-                                              options:MTLResourceStorageModeShared];
-            id<MTLBuffer> icbArgumentBuffer =
-                [m_Context.device newBufferWithLength:fillState.icbEncoder.encodedLength
-                                              options:MTLResourceStorageModeShared];
-            if (!icb || !executionRange || !drawInfoBuffer || !drawParamsBuffer || !paramsBuffer || !icbArgumentBuffer)
+                m_TransientIndirectResources.acquireIndirectCommandBuffer(icbDesc, NSUInteger(maxDrawCount), nullptr, &icbCapacity);
+            const TransientBufferAllocation executionRange =
+                m_TransientIndirectResources.allocatePrivate(sizeof(MTLIndirectCommandBufferExecutionRange));
+            const TransientBufferAllocation drawInfo = m_TransientIndirectResources.allocatePrivate(drawInfoSize);
+            const TransientBufferAllocation drawParams = m_TransientIndirectResources.allocatePrivate(drawParamsSize);
+            const TransientBufferAllocation paramsAllocation =
+                m_TransientIndirectResources.allocateShared(sizeof(GeometryIndexedIndirectCountParams));
+            const TransientBufferAllocation icbArgumentBuffer =
+                m_TransientIndirectResources.allocateShared(fillState.icbEncoder.encodedLength);
+            if (!icb || !executionRange.buffer || !drawInfo.buffer || !drawParams.buffer ||
+                !paramsAllocation.buffer || !paramsAllocation.cpuAddress ||
+                !icbArgumentBuffer.buffer || !icbArgumentBuffer.cpuAddress)
             {
                 m_Context.error("[metal3] failed to allocate geometry-emulation counted indexed indirect ICB resources");
                 return;
@@ -2746,13 +2992,13 @@ namespace nvrhi::metal3
 
             // Metal exposes the ICB to a compute shader through an argument
             // buffer. The helper writes render_command entries into this ICB.
-            [fillState.icbEncoder setArgumentBuffer:icbArgumentBuffer offset:0];
+            [fillState.icbEncoder setArgumentBuffer:icbArgumentBuffer.buffer offset:icbArgumentBuffer.offset];
             [fillState.icbEncoder setIndirectCommandBuffer:icb atIndex:0];
 
             // CPU-written constants tell the helper where to read the GPU count
             // and args, how to interpret the current index buffer, and whether
             // optional reflected argument tables must be encoded into each command.
-            auto* params = reinterpret_cast<GeometryIndexedIndirectCountParams*>([paramsBuffer contents]);
+            auto* params = reinterpret_cast<GeometryIndexedIndirectCountParams*>(paramsAllocation.cpuAddress);
             params->maxDrawCount = maxDrawCount;
             params->paramOffsetBytes = paramOffsetBytes;
             params->countOffsetBytes = countOffsetBytes;
@@ -2769,11 +3015,11 @@ namespace nvrhi::metal3
             params->hasFragmentArgumentTable = fragmentArgumentTable.buffer ? 1u : 0u;
 
             m_ReferencedNativeResources.push_back(icb);
-            m_ReferencedNativeResources.push_back(executionRange);
-            m_ReferencedNativeBuffers.push_back(drawInfoBuffer);
-            m_ReferencedNativeBuffers.push_back(drawParamsBuffer);
-            m_ReferencedNativeBuffers.push_back(paramsBuffer);
-            m_ReferencedNativeBuffers.push_back(icbArgumentBuffer);
+            m_ReferencedNativeBuffers.push_back(executionRange.buffer);
+            m_ReferencedNativeBuffers.push_back(drawInfo.buffer);
+            m_ReferencedNativeBuffers.push_back(drawParams.buffer);
+            m_ReferencedNativeBuffers.push_back(paramsAllocation.buffer);
+            m_ReferencedNativeBuffers.push_back(icbArgumentBuffer.buffer);
             m_ReferencedNativeBuffers.push_back(vertexBufferTable);
             if (objectArgumentTable.buffer)
                 m_ReferencedNativeBuffers.push_back(objectArgumentTable.buffer);
@@ -2788,7 +3034,7 @@ namespace nvrhi::metal3
             // commands below min(gpuCount, maxDrawCount), and executeCommands uses
             // the GPU-written range to skip the rest.
             id<MTLBlitCommandEncoder> blit = [trackedCmdBuffer blitCommandEncoder];
-            [blit resetCommandsInBuffer:icb withRange:NSMakeRange(0, maxDrawCount)];
+            [blit resetCommandsInBuffer:icb withRange:NSMakeRange(0, icbCapacity)];
             [blit endEncoding];
 
             // Fill the per-draw IRRuntime records and ICB commands on GPU. This is
@@ -2803,25 +3049,25 @@ namespace nvrhi::metal3
             [compute setComputePipelineState:fillState.pipeline];
             [compute setBuffer:indirectParams->buffer offset:0 atIndex:0];
             [compute setBuffer:indirectCount->buffer offset:0 atIndex:1];
-            [compute setBuffer:executionRange offset:0 atIndex:2];
-            [compute setBuffer:icbArgumentBuffer offset:0 atIndex:3];
-            [compute setBuffer:drawInfoBuffer offset:0 atIndex:4];
-            [compute setBuffer:drawParamsBuffer offset:0 atIndex:5];
-            [compute setBuffer:paramsBuffer offset:0 atIndex:6];
+            [compute setBuffer:executionRange.buffer offset:executionRange.offset atIndex:2];
+            [compute setBuffer:icbArgumentBuffer.buffer offset:icbArgumentBuffer.offset atIndex:3];
+            [compute setBuffer:drawInfo.buffer offset:drawInfo.offset atIndex:4];
+            [compute setBuffer:drawParams.buffer offset:drawParams.offset atIndex:5];
+            [compute setBuffer:paramsAllocation.buffer offset:paramsAllocation.offset atIndex:6];
             [compute setBuffer:vertexBufferTable offset:vertexBufferTableOffset atIndex:7];
-            [compute setBuffer:(objectArgumentTable.buffer ? objectArgumentTable.buffer : paramsBuffer)
-                        offset:(objectArgumentTable.buffer ? objectArgumentTable.offset : 0) atIndex:8];
-            [compute setBuffer:(meshArgumentTable.buffer ? meshArgumentTable.buffer : paramsBuffer)
-                        offset:(meshArgumentTable.buffer ? meshArgumentTable.offset : 0) atIndex:9];
-            [compute setBuffer:(fragmentArgumentTable.buffer ? fragmentArgumentTable.buffer : paramsBuffer)
-                        offset:(fragmentArgumentTable.buffer ? fragmentArgumentTable.offset : 0) atIndex:10];
+            [compute setBuffer:(objectArgumentTable.buffer ? objectArgumentTable.buffer : paramsAllocation.buffer)
+                        offset:(objectArgumentTable.buffer ? objectArgumentTable.offset : paramsAllocation.offset) atIndex:8];
+            [compute setBuffer:(meshArgumentTable.buffer ? meshArgumentTable.buffer : paramsAllocation.buffer)
+                        offset:(meshArgumentTable.buffer ? meshArgumentTable.offset : paramsAllocation.offset) atIndex:9];
+            [compute setBuffer:(fragmentArgumentTable.buffer ? fragmentArgumentTable.buffer : paramsAllocation.buffer)
+                        offset:(fragmentArgumentTable.buffer ? fragmentArgumentTable.offset : paramsAllocation.offset) atIndex:10];
             [compute useResource:indirectParams->buffer usage:MTLResourceUsageRead];
             [compute useResource:indirectCount->buffer usage:MTLResourceUsageRead];
             [compute useResource:indexBuffer->buffer usage:MTLResourceUsageRead];
-            [compute useResource:executionRange usage:MTLResourceUsageWrite];
-            [compute useResource:drawInfoBuffer usage:MTLResourceUsageWrite];
-            [compute useResource:drawParamsBuffer usage:MTLResourceUsageWrite];
-            [compute useResource:icbArgumentBuffer usage:MTLResourceUsageRead];
+            [compute useResource:executionRange.buffer usage:MTLResourceUsageWrite];
+            [compute useResource:drawInfo.buffer usage:MTLResourceUsageWrite];
+            [compute useResource:drawParams.buffer usage:MTLResourceUsageWrite];
+            [compute useResource:icbArgumentBuffer.buffer usage:MTLResourceUsageRead];
             [compute useResource:vertexBufferTable usage:MTLResourceUsageRead];
             if (objectArgumentTable.buffer)
                 [compute useResource:objectArgumentTable.buffer usage:MTLResourceUsageRead];
@@ -2855,16 +3101,16 @@ namespace nvrhi::metal3
             [renderEncoder useResource:icb
                                   usage:MTLResourceUsageRead
                                  stages:MTLRenderStageObject | MTLRenderStageMesh];
-            [renderEncoder useResource:executionRange
+            [renderEncoder useResource:executionRange.buffer
                                   usage:MTLResourceUsageRead
                                  stages:MTLRenderStageObject | MTLRenderStageMesh];
             [renderEncoder useResource:indexBuffer->buffer
                                   usage:MTLResourceUsageRead
                                  stages:MTLRenderStageObject | MTLRenderStageMesh];
-            [renderEncoder useResource:drawInfoBuffer
+            [renderEncoder useResource:drawInfo.buffer
                                   usage:MTLResourceUsageRead
                                  stages:MTLRenderStageObject | MTLRenderStageMesh];
-            [renderEncoder useResource:drawParamsBuffer
+            [renderEncoder useResource:drawParams.buffer
                                   usage:MTLResourceUsageRead
                                  stages:MTLRenderStageObject | MTLRenderStageMesh];
             [renderEncoder useResource:vertexBufferTable
@@ -2886,8 +3132,8 @@ namespace nvrhi::metal3
             // Execute only commands 0..gpuCount-1, where gpuCount was clamped by
             // the compute helper and written into executionRange on the GPU.
             [renderEncoder executeCommandsInBuffer:icb
-                                    indirectBuffer:executionRange
-                              indirectBufferOffset:0];
+                                    indirectBuffer:executionRange.buffer
+                              indirectBufferOffset:executionRange.offset];
         }
         else if (traceMetalRuntime())
         {

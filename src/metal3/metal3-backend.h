@@ -1,5 +1,7 @@
 #pragma once
 
+#include <mutex>
+
 #include "nvrhi/common/aftermath.h"
 #include "nvrhi/common/resource.h"
 #include "nvrhi/nvrhi.h"
@@ -217,6 +219,99 @@ namespace nvrhi::metal3
         std::vector<Chunk> m_Chunks;
 
         Chunk* findOrCreateChunk(size_t size, size_t alignment);
+    };
+
+    struct TransientBufferAllocation
+    {
+        id<MTLBuffer> buffer = nil;
+        NSUInteger offset = 0;
+        NSUInteger size = 0;
+        // null for private-storage pages
+        void* cpuAddress = nullptr;
+    };
+
+    // Per-command-buffer temporary storage for indirect draw helpers. A slot is
+    // reused only after Metal reports completion for the command buffer that
+    // used it, so page contents and ICB commands stay valid for the GPU.
+    class TransientIndirectResourcePool
+    {
+    public:
+        struct Stats
+        {
+            size_t sharedPageCount = 0;
+            size_t privatePageCount = 0;
+            size_t sharedPagesCreated = 0;
+            size_t privatePagesCreated = 0;
+            size_t bytesReserved = 0;
+            size_t indirectCommandBuffersReused = 0;
+            size_t indirectCommandBuffersCreated = 0;
+            bool usedOverflowSlot = false;
+        };
+
+        explicit TransientIndirectResourcePool(const MTL3Context& context);
+        void beginCommandBuffer();
+        void submitCommandBuffer(id<MTLCommandBuffer> commandBuffer);
+        Stats getActiveStats() const;
+        TransientBufferAllocation allocateShared(NSUInteger size, NSUInteger alignment = 256);
+        TransientBufferAllocation allocatePrivate(NSUInteger size, NSUInteger alignment = 256);
+        id<MTLIndirectCommandBuffer> acquireIndirectCommandBuffer(
+            MTLIndirectCommandBufferDescriptor* descriptor, NSUInteger requiredCapacity,
+            bool* wasCreated = nullptr, NSUInteger* capacity = nullptr);
+
+    private:
+        struct BufferPage
+        {
+            id<MTLBuffer> buffer = nil;
+            NSUInteger capacity = 0;
+            NSUInteger writeOffset = 0;
+            uint8_t* cpuAddress = nullptr;  // only for shared pages
+        };
+
+        struct IndirectCommandBufferKey
+        {
+            // every descriptor property that changes ICB compatibility:
+            MTLIndirectCommandType commandTypes{};
+            bool inheritPipelineState = false;
+            bool inheritBuffers = false;
+            NSUInteger maxVertexBufferBindCount = 0;
+            NSUInteger maxFragmentBufferBindCount = 0;
+            NSUInteger maxObjectBufferBindCount = 0;
+            NSUInteger maxMeshBufferBindCount = 0;
+
+            bool operator==(const IndirectCommandBufferKey& other) const;
+        };
+
+        struct PooledIndirectCommandBuffer
+        {
+            IndirectCommandBufferKey key;
+            NSUInteger capacity = 0;    // maxCommandCount used at creation
+            id<MTLIndirectCommandBuffer> commandBuffer = nil;
+        };
+
+        struct FrameSlot
+        {
+            bool inFlight = false;
+            bool isOverflow = false;
+            Stats stats;
+            std::vector<BufferPage> sharedPages;
+            std::vector<BufferPage> privatePages;
+            std::vector<PooledIndirectCommandBuffer> indirectCommandBuffers;
+        };
+
+        struct State
+        {
+            std::mutex mutex;
+            std::vector<FrameSlot> slots;
+        };
+
+        const MTL3Context& m_Context;
+        // Completion handlers retain State, not CommandList, so a submitted
+        // command buffer cannot update a destroyed CommandList instance.
+        std::shared_ptr<State> m_State;
+        size_t m_ActiveSlot = size_t(-1);
+
+        TransientBufferAllocation allocate(NSUInteger size, NSUInteger alignment,
+            MTLResourceOptions options, std::vector<BufferPage> FrameSlot::*pages);
     };
 
     class Texture : public RefCounter<ITexture>
@@ -559,6 +654,7 @@ namespace nvrhi::metal3
         // Argument tables must use stable memory until command-buffer
         // completion, but must not create a native MTLBuffer per draw.
         UploadManager m_ArgumentTableManager;
+        TransientIndirectResourcePool m_TransientIndirectResources;
         
         CommandListParameters m_Desc;
 
