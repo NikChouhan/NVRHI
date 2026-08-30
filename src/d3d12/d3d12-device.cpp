@@ -307,9 +307,17 @@ namespace nvrhi::d3d12
             argDesc.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
             m_Context.device->CreateCommandSignature(&csDesc, nullptr, IID_PPV_ARGS(&m_Context.dispatchIndirectSignature));
 
-            csDesc.ByteStride = 12;
-            argDesc.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH;
-            m_Context.device->CreateCommandSignature(&csDesc, nullptr, IID_PPV_ARGS(&m_Context.dispatchMeshIndirectSignature));
+            // DISPATCH_MESH is invalid on adapters without mesh shader
+            // support. Some drivers return E_INVALIDARG here, Intel's Xe
+            // driver instead access-violate inside CreateCommandSignature
+            // and hence crashing the game. We aren't using mesh shaders on 
+            // dx12 device either so this is helpful
+            if (m_MeshletsSupported)
+            {
+                csDesc.ByteStride = 12;
+                argDesc.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH;
+                m_Context.device->CreateCommandSignature(&csDesc, nullptr, IID_PPV_ARGS(&m_Context.dispatchMeshIndirectSignature));
+            }
         }
         
         m_FenceEvent = CreateEvent(nullptr, false, false, nullptr);
