@@ -1676,6 +1676,7 @@ namespace nvrhi::metal3
         {
             [m_RenderEncoder endEncoding];
             m_RenderEncoder = nil;
+            m_RenderEncoderFramebuffer = nullptr;
         }
         if (m_ComputeEncoder)
         {
@@ -1708,6 +1709,7 @@ namespace nvrhi::metal3
         m_GeometryEmulationVertexBuffersOffset = 0;
         m_RenderEncoder = nil;
         m_ComputeEncoder = nil;
+        m_RenderEncoderFramebuffer = nullptr;
     }
     // closing it commits the command buffer to queue, and invalidates the encoders, command buffers
     void CommandList::close()
@@ -2101,7 +2103,6 @@ namespace nvrhi::metal3
     {
         m_CurrentGraphicsState = state;
         m_CurrentGraphicsStateValid = true;
-        endEncoding();
         id<MTLRenderCommandEncoder> encoder = getOrCreateRenderEncoder();
         auto* pipeline = static_cast<GraphicsPipeline*>(state.pipeline);
         if (!encoder || !pipeline)
@@ -2117,11 +2118,15 @@ namespace nvrhi::metal3
 
     id<MTLRenderCommandEncoder> CommandList::getOrCreateRenderEncoder()
     {
-        if (m_RenderEncoder)
+        auto* framebuffer = static_cast<Framebuffer*>(m_CurrentGraphicsState.framebuffer);
+        if (m_RenderEncoder && m_RenderEncoderFramebuffer == framebuffer)
             return m_RenderEncoder;
+
+        // Changing render targets is a real render-pass break. Do not end an
+        // otherwise compatible pass just because its pipeline or bindings
+        // changed: those can be rebound on the existing encoder.
         endEncoding();
 
-        auto* framebuffer = static_cast<Framebuffer*>(m_CurrentGraphicsState.framebuffer);
         if (!framebuffer)
         {
             if (traceMetalRuntime())
@@ -2155,8 +2160,12 @@ namespace nvrhi::metal3
 #endif
 
         m_RenderEncoder = [trackedCmdBuffer renderCommandEncoderWithDescriptor:rp];
+        m_RenderEncoderFramebuffer = framebuffer;
         if (!m_RenderEncoder)
+        {
+            m_RenderEncoderFramebuffer = nullptr;
             m_Context.error("[metal3-trace] failed to create render command encoder");
+        }
         return m_RenderEncoder;
     }
     id<MTLComputeCommandEncoder> CommandList::getOrCreateComputeEncoder()
@@ -3145,7 +3154,6 @@ namespace nvrhi::metal3
     {
         m_CurrentComputeState = state;
         m_CurrentComputeStateValid = true;
-        endEncoding();
         id<MTLComputeCommandEncoder> encoder = getOrCreateComputeEncoder();
         auto* pipeline = static_cast<ComputePipeline*>(state.pipeline);
         if (!encoder || !pipeline)

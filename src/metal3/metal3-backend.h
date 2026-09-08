@@ -682,6 +682,10 @@ namespace nvrhi::metal3
         id<MTLCommandBuffer> trackedCmdBuffer;
         id<MTLRenderCommandEncoder> m_RenderEncoder = nil;
         id<MTLComputeCommandEncoder> m_ComputeEncoder = nil;
+        // The framebuffer whose attachments define m_RenderEncoder's active
+        // render pass. Pipeline and binding changes are legal within that
+        // pass; only a framebuffer change requires a new render encoder.
+        Framebuffer* m_RenderEncoderFramebuffer = nullptr;
 
         std::vector<BindingSetHandle> m_ReferencedBindingSets;
         std::vector<id<MTLBuffer>> m_ReferencedNativeBuffers;
