@@ -144,7 +144,7 @@ namespace nvrhi::metal3
         case ResourceType::Texture_UAV:
         {
             auto* texture = static_cast<Texture*>(item.resourceHandle);
-            entry.texture = texture ? texture->texture : nil;
+            entry.texture = texture ? texture->getView(item.format, item.subresources, item.dimension) : nil;
             break;
         }
         // for samplers, extract and store id<MTLSamplerState + mip bias

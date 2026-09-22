@@ -324,6 +324,7 @@ namespace nvrhi::metal3
         bool ownsTexture = true;
 
         const TextureDesc& getDesc() const override { return desc; }
+        id<MTLTexture> getView(Format format, TextureSubresourceSet subresources, TextureDimension dimension);
         Object getNativeObject(ObjectType objectType) override;
         Object getNativeView(ObjectType objectType, Format format = Format::UNKNOWN, TextureSubresourceSet subresources = AllSubresources, TextureDimension dimension = TextureDimension::Unknown, bool isReadOnlyDSV = false) override;
     };

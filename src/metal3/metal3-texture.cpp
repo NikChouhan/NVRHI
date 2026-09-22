@@ -100,9 +100,47 @@ namespace nvrhi::metal3
         return nullptr;
     }
 
+    id<MTLTexture> Texture::getView(Format format, TextureSubresourceSet subresources, TextureDimension dimension)
+    {
+        if (!texture)
+            return nil;
+
+        const Format viewFormat = format == Format::UNKNOWN ? desc.format : format;
+        const MTLPixelFormat metalFormat = convertFormat(viewFormat);
+        if (metalFormat == MTLPixelFormatInvalid)
+            return nil;
+
+        const TextureDimension viewDimension = dimension == TextureDimension::Unknown ? desc.dimension : dimension;
+        const MTLTextureType metalDimension = convertTextureDimension(viewDimension, desc.sampleCount);
+        const TextureSubresourceSet resolved = subresources.resolve(desc, false);
+
+        if (resolved.numMipLevels == 0 || resolved.numArraySlices == 0)
+            return nil;
+
+        if (viewDimension == TextureDimension::TextureCube && resolved.numArraySlices != 6)
+            return nil;
+        if (viewDimension == TextureDimension::TextureCubeArray && (resolved.numArraySlices % 6) != 0)
+            return nil;
+
+        // dont allocate a view when the native texture already has the requested format, type, mip range & slice range
+        const bool allMips = resolved.baseMipLevel == 0 && resolved.numMipLevels == desc.mipLevels;
+        const bool allSlices = resolved.baseArraySlice == 0 && resolved.numArraySlices == desc.arraySize;
+        if (metalFormat == texture.pixelFormat && metalDimension == texture.textureType && allMips && allSlices)
+            return texture;
+
+        const NSRange levels = NSMakeRange(resolved.baseMipLevel, resolved.numMipLevels);
+        const NSRange slices = NSMakeRange(resolved.baseArraySlice, resolved.numArraySlices);
+        return [texture newTextureViewWithPixelFormat:metalFormat
+                                          textureType:metalDimension
+                                               levels:levels
+                                               slices:slices];
+    }
+
     Object Texture::getNativeView(ObjectType objectType, Format format, TextureSubresourceSet subresources, TextureDimension dimension, bool isReadOnlyDSV)
     {
-        (void)format; (void)subresources; (void)dimension; (void)isReadOnlyDSV;
-        return getNativeObject(objectType);
+        (void)isReadOnlyDSV;
+        if (objectType != ObjectTypes::MTL3_Texture)
+            return nullptr;
+        return Object((__bridge void*)getView(format, subresources, dimension));
     }
 }
