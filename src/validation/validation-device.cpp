@@ -1518,7 +1518,7 @@ namespace nvrhi::validation
             return viewDimension == TextureDimension::Texture2DArray;
 
         if (resourceDimension == TextureDimension::TextureCube || resourceDimension == TextureDimension::TextureCubeArray)
-            return viewDimension == TextureDimension::Texture2DArray;
+            return viewDimension == TextureDimension::Texture2DArray || viewDimension == TextureDimension::Texture2D;
 
         return false;
     }
