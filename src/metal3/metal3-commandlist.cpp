@@ -1756,24 +1756,48 @@ namespace nvrhi::metal3
 
     void CommandList::clearTextureFloat(ITexture* t, TextureSubresourceSet subresources, const Color& clearColor)
     {
-        (void)subresources;
         auto* texture = static_cast<Texture*>(t);
         if (!texture || !texture->texture)
             return;
+
         if (!texture->desc.isRenderTarget)
         {
             m_Context.error("[nvrhi] clearTextureFloat requires isRenderTarget on Metal.");
             return;
         }
 
-        MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
-        rp.colorAttachments[0].texture = texture->texture;
-        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
-        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-        rp.colorAttachments[0].clearColor = MTLClearColorMake(clearColor.r, clearColor.g, clearColor.b, clearColor.a);
+        const TextureSubresourceSet resolved = subresources.resolve(texture->desc, false);
+        if (resolved.numMipLevels == 0 || resolved.numArraySlices == 0)
+            return;
+
         endEncoding();
-        id<MTLRenderCommandEncoder> encoder = [trackedCmdBuffer renderCommandEncoderWithDescriptor:rp];
-        [encoder endEncoding];
+
+        for (MipLevel mip = resolved.baseMipLevel;
+             mip < resolved.baseMipLevel + resolved.numMipLevels;
+             ++mip)
+        {
+            for (ArraySlice slice = resolved.baseArraySlice;
+                 slice < resolved.baseArraySlice + resolved.numArraySlices;
+                 ++slice)
+            {
+                MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+                MTLRenderPassColorAttachmentDescriptor* attachment = rp.colorAttachments[0];
+                attachment.texture = texture->texture;
+                attachment.level = mip;
+                attachment.slice = slice;
+                attachment.loadAction = MTLLoadActionClear;
+                attachment.storeAction = MTLStoreActionStore;
+                attachment.clearColor = MTLClearColorMake(clearColor.r, clearColor.g, clearColor.b, clearColor.a);
+
+                id<MTLRenderCommandEncoder> encoder = [trackedCmdBuffer renderCommandEncoderWithDescriptor:rp];
+                if (!encoder)
+                {
+                    m_Context.error("[nvrhi] Failed to create Metal render encoder for clearTextureFloat.");
+                    return;
+                }
+                [encoder endEncoding];
+            }
+        }
     }
     
     void CommandList::clearDepthStencilTexture(ITexture* t, TextureSubresourceSet subresources, bool clearDepth, float depth, bool clearStencil, uint8_t stencil)
