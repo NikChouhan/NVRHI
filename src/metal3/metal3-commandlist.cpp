@@ -3634,7 +3634,6 @@ namespace nvrhi::metal3
 
     // ---- stubs ----
 
-    // no staging texture copy support
     void CommandList::copyTexture(IStagingTexture* dest, const TextureSlice& destSlice, ITexture* src, const TextureSlice& srcSlice)
     {
         auto* staging = static_cast<StagingTexture*>(dest);
@@ -3645,9 +3644,17 @@ namespace nvrhi::metal3
         const TextureSlice dstResolved = destSlice.resolve(staging->desc);
         const TextureSlice srcResolved = srcSlice.resolve(texture->desc);
 
-        // current implementation supports the full preview texture only, the specifc path needed
+        // the staging implementation supports one complete 2D color
+        // subresource. Arrays, mips, compressed formats, and partial copies
+        // require per subresource staging layouts. not in scope rn!!!
         if (dstResolved.arraySlice != 0 || dstResolved.mipLevel != 0 ||
-            dstResolved.x != 0 || dstResolved.y != 0 ||
+            dstResolved.x != 0 || dstResolved.y != 0 || dstResolved.z != 0 ||
+            dstResolved.width != staging->desc.width ||
+            dstResolved.height != staging->desc.height || dstResolved.depth != 1 ||
+            texture->desc.dimension != TextureDimension::Texture2D ||
+            texture->desc.sampleCount != 1 ||
+            texture->desc.format != staging->desc.format ||
+            srcResolved.x != 0 || srcResolved.y != 0 || srcResolved.z != 0 ||
             srcResolved.width != staging->desc.width ||
             srcResolved.height != staging->desc.height ||
             srcResolved.depth != 1)

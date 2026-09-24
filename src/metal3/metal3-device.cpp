@@ -123,49 +123,58 @@ namespace nvrhi::metal3
 
     StagingTextureHandle Device::createStagingTexture(const TextureDesc& d, CpuAccessMode cpuAccess)
     {
-        // the case with texture being 2d texture, have a single mip level, array size and the format being 
-        // RGBA8_UNORM is handled. the texture with this format will be used as a readback texture
+        const FormatInfo& formatInfo = getFormatInfo(d.format);
+
+        // the staging implementation handles single-subresource 2D
+        // color textures. BCn, depth/stencil, array, and mip
+        // layouts need per subresource footprints. not in scope rn!!
         if (cpuAccess != CpuAccessMode::Read || d.dimension != TextureDimension::Texture2D ||
-            d.format !=Format::RGBA8_UNORM || d.mipLevels != 1 || d.arraySize != 1)
+            d.sampleCount != 1 || d.mipLevels != 1 || d.arraySize != 1 ||
+            formatInfo.kind == FormatKind::DepthStencil || formatInfo.blockSize != 1 ||
+            formatInfo.bytesPerBlock == 0)
         {
-            m_Context.error("[nvrhi] Unsupported MEtal staging texture description");
+            m_Context.error("[nvrhi] Unsupported Metal staging texture description.");
             return nullptr;
         }
+
         auto* staging = new StagingTexture();
         staging->desc = d;
         staging->cpuAccess = cpuAccess;
-        staging->rowPitch = align_up(NSUInteger(d.width) * 4u, 256u);
-
+        staging->rowPitch = align_up(NSUInteger(d.width) * formatInfo.bytesPerBlock, 256u);
         staging->imageBytes = staging->rowPitch * NSUInteger(d.height);
-
         staging->buffer = [m_Context.device newBufferWithLength:staging->imageBytes options:MTLResourceStorageModeShared];
 
-        if(!staging->buffer)
+        if (!staging->buffer)
         {
             delete staging;
-            m_Context.error("[nvrhi] Failed to create metal staging buffer");
+            m_Context.error("[nvrhi] Failed to create Metal staging buffer.");
             return nullptr;
         }
+
         return StagingTextureHandle::Create(staging);
     }
 
     void* Device::mapStagingTexture(IStagingTexture* tex, const TextureSlice& slice, CpuAccessMode cpuAccess, size_t* outRowPitch)
     {
-        // again, only the texture with the specific capabilities are supported for mapping
         auto* staging = static_cast<StagingTexture*>(tex);
-        if(!staging || !staging->buffer || cpuAccess != CpuAccessMode::Read ||
-            slice.arraySlice !=0 || slice.mipLevel !=0 || slice.x != 0 || slice.y !=0)
+        const TextureSlice resolved = staging ? slice.resolve(staging->desc) : TextureSlice{};
+        if (!staging || !staging->buffer || !outRowPitch ||
+            cpuAccess != CpuAccessMode::Read || staging->cpuAccess != CpuAccessMode::Read ||
+            resolved.arraySlice != 0 || resolved.mipLevel != 0 ||
+            resolved.x != 0 || resolved.y != 0 || resolved.z != 0)
         {
             return nullptr;
         }
+
         *outRowPitch = staging->rowPitch;
         return [staging->buffer contents];
     }
 
     void Device::unmapStagingTexture(IStagingTexture* tex)
-{
-    // MTLStorageModeShared requires no explicit unmap operation
-}
+    {
+        (void)tex;
+        // MTLStorageModeShared requires no explicit unmap operation.
+    }
 
     void Device::getTextureTiling(ITexture* texture, uint32_t* numTiles, PackedMipDesc* desc, TileShape* tileShape, uint32_t* subresourceTilingsNum, SubresourceTiling* subresourceTilings)
     {
