@@ -1760,6 +1760,11 @@ namespace nvrhi::metal3
         auto* texture = static_cast<Texture*>(t);
         if (!texture || !texture->texture)
             return;
+        if (!texture->desc.isRenderTarget)
+        {
+            m_Context.error("[nvrhi] clearTextureFloat requires isRenderTarget on Metal.");
+            return;
+        }
 
         MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
         rp.colorAttachments[0].texture = texture->texture;
