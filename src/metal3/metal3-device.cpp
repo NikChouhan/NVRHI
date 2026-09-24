@@ -1,10 +1,13 @@
 #include "metal3-backend.h"
 #include "nvrhi/common/misc.h"
 #include "nvrhi/common/resource.h"
+#include "nvrhi/nvrhi.h"
 #include "nvrhi/utils.h"
 #include <Metal/Metal.h>
 #include <atomic>
+#include <cstddef>
 #include <cstdio>
+#include <objc/NSObjCRuntime.h>
 
 namespace nvrhi::metal3
 {
@@ -113,20 +116,56 @@ namespace nvrhi::metal3
         return false;
     }
 
+    static NSUInteger align_up(NSUInteger value, NSUInteger alignment)
+    {
+        return (value + alignment -1u) & ~(alignment - 1u);
+    }
+
     StagingTextureHandle Device::createStagingTexture(const TextureDesc& d, CpuAccessMode cpuAccess)
     {
-        // TODO: stub
+        // the case with texture being 2d texture, have a single mip level, array size and the format being 
+        // RGBA8_UNORM is handled. the texture with this format will be used as a readback texture
+        if (cpuAccess != CpuAccessMode::Read || d.dimension != TextureDimension::Texture2D ||
+            d.format !=Format::RGBA8_UNORM || d.mipLevels != 1 || d.arraySize != 1)
+        {
+            m_Context.error("[nvrhi] Unsupported MEtal staging texture description");
+            return nullptr;
+        }
+        auto* staging = new StagingTexture();
+        staging->desc = d;
+        staging->cpuAccess = cpuAccess;
+        staging->rowPitch = align_up(NSUInteger(d.width) * 4u, 256u);
+
+        staging->imageBytes = staging->rowPitch * NSUInteger(d.height);
+
+        staging->buffer = [m_Context.device newBufferWithLength:staging->imageBytes options:MTLResourceStorageModeShared];
+
+        if(!staging->buffer)
+        {
+            delete staging;
+            m_Context.error("[nvrhi] Failed to create metal staging buffer");
+            return nullptr;
+        }
+        return StagingTextureHandle::Create(staging);
     }
 
     void* Device::mapStagingTexture(IStagingTexture* tex, const TextureSlice& slice, CpuAccessMode cpuAccess, size_t* outRowPitch)
     {
-        // TODO: stub
+        // again, only the texture with the specific capabilities are supported for mapping
+        auto* staging = static_cast<StagingTexture*>(tex);
+        if(!staging || !staging->buffer || cpuAccess != CpuAccessMode::Read ||
+            slice.arraySlice !=0 || slice.mipLevel !=0 || slice.x != 0 || slice.y !=0)
+        {
+            return nullptr;
+        }
+        *outRowPitch = staging->rowPitch;
+        return [staging->buffer contents];
     }
 
     void Device::unmapStagingTexture(IStagingTexture* tex)
-    {
-        // TODO: stub
-    }
+{
+    // MTLStorageModeShared requires no explicit unmap operation
+}
 
     void Device::getTextureTiling(ITexture* texture, uint32_t* numTiles, PackedMipDesc* desc, TileShape* tileShape, uint32_t* subresourceTilingsNum, SubresourceTiling* subresourceTilings)
     {

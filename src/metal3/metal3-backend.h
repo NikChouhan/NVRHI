@@ -329,11 +329,15 @@ namespace nvrhi::metal3
         Object getNativeView(ObjectType objectType, Format format = Format::UNKNOWN, TextureSubresourceSet subresources = AllSubresources, TextureDimension dimension = TextureDimension::Unknown, bool isReadOnlyDSV = false) override;
     };
 
-    //TODO: stub
     class StagingTexture : public RefCounter<IStagingTexture>
     {
     public:
         TextureDesc desc;
+        id<MTLBuffer> buffer = nil;
+        CpuAccessMode cpuAccess = CpuAccessMode::None;
+        NSUInteger rowPitch = 0;
+        NSUInteger imageBytes = 0;
+
         const TextureDesc& getDesc() const override { return desc; }
     };
 
@@ -545,10 +549,8 @@ namespace nvrhi::metal3
         void setSamplerFeedbackTextureState(ISamplerFeedbackTexture* texture, ResourceStates stateBits) override;
 
         void copyTexture(ITexture* dest, const TextureSlice& destSlice, ITexture* src, const TextureSlice& srcSlice) override;
-        //// staging texture path DNE ////
         void copyTexture(IStagingTexture* dest, const TextureSlice& destSlice, ITexture* src, const TextureSlice& srcSlice) override;
         void copyTexture(ITexture* dest, const TextureSlice& destSlice, IStagingTexture* src, const TextureSlice& srcSlice) override;
-        //// staging texture path DNE /////
         void writeTexture(ITexture* dest, uint32_t arraySlice, uint32_t mipLevel, const void* data, size_t rowPitch, size_t depthPitch) override;
         void resolveTexture(ITexture* dest, const TextureSubresourceSet& dstSubresources, ITexture* src, const TextureSubresourceSet& srcSubresources) override;
 
