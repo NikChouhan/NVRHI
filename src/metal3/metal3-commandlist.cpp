@@ -3246,6 +3246,9 @@ namespace nvrhi::metal3
         [encoder setDepthStencilState:pipeline->depthStencilState];
         [encoder setCullMode:pipeline->cullMode];
         [encoder setFrontFacingWinding:pipeline->frontWinding];
+        [encoder setDepthBias:float(pipeline->desc.renderState.rasterState.depthBias)
+                    slopeScale:pipeline->desc.renderState.rasterState.slopeScaledDepthBias
+                         clamp:pipeline->desc.renderState.rasterState.depthBiasClamp];
 
         for (const Viewport& vp : state.viewport.viewports)
             [encoder setViewport:MTLViewport{ vp.minX, vp.minY, vp.width(), vp.height(), vp.minZ, vp.maxZ }];
